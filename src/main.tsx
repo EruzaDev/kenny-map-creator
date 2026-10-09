@@ -9,6 +9,8 @@ import { NearGoalAnnouncement } from './near-audio';
 import { rankCalls } from './scheduler';
 import type { CallRequest } from './scheduler';
 import { modelLabel } from './model-label';
+import { SensorOverlay } from './sensor-overlay';
+import type { SensorFrame } from './sensor-geometry';
 type Live = {
   type: 'map';
   revision: number;
@@ -27,6 +29,10 @@ type ModelChoice = {
   bytes: number;
 };
 type ReplayFrame = {
+  camera_visible_marker_ids?: number[];
+  marker_localization_updated?: boolean;
+  sensors?: SensorFrame;
+  guard_reasons?: string[];
   step: number;
   pose: number[];
   estimate: number[];
@@ -80,6 +86,10 @@ function App() {
     [playing, setPlaying] = useState(false),
     [playSpeed, setPlaySpeed] = useState(2);
   const [nearSoundEnabled, setNearSoundEnabled] = useState(true);
+  const [showLidar,setShowLidar]=useState(false);
+  const [showDepth,setShowDepth]=useState(false);
+  const [showFloor,setShowFloor]=useState(false);
+  const [showMarkers,setShowMarkers]=useState(false);
   const nearAnnouncement = useRef<NearGoalAnnouncement | null>(null);
   if (!nearAnnouncement.current) nearAnnouncement.current = new NearGoalAnnouncement(nearSoundUrl);
   useEffect(() => () => nearAnnouncement.current?.dispose(), []);
@@ -770,6 +780,11 @@ function App() {
                   element.addEventListener('pointercancel', up);
                 }} />}</g>;
             })}
+ {!viewLive && replayFrame?.sensors && <SensorOverlay sensors={replayFrame.sensors} visual={visual} lidar={showLidar} depth={showDepth} floor={showFloor} />}
+ {!viewLive && showMarkers && replayFrame?.camera_visible_marker_ids && <g pointerEvents="none" aria-label="Camera-visible ArUco markers">{project.markers.filter(m => replayFrame.camera_visible_marker_ids!.includes(m.id)).map(m => {
+   const p=visual([m.x,m.y]);
+   return <g key={m.uid}><circle cx={p[0]} cy={p[1]} r={Math.max(.3,m.size/2+.15)} fill="#4ade80" opacity=".3" /><circle cx={p[0]} cy={p[1]} r={Math.max(.3,m.size/2+.15)} fill="none" stroke="#16a34a" strokeWidth=".05" /></g>;
+ })}</g>}
  {!viewLive && project.markers.map(m => {
               const p = visual([m.x, m.y]),
                 s = Math.max(.3, m.size);
@@ -816,6 +831,17 @@ function App() {
             });
           }} />)}</> : <div className="empty-properties"><span>↖</span><strong>Select an object</strong><p>Click a marker or obstacle to edit its position and dimensions.</p></div>}
  {project.background && <label className="field separated">Floor plan opacity<input type="range" min="0" max="1" step=".05" value={opacity} onChange={e => setOpacity(Number(e.target.value))} /></label>}
+ <div className="navigation-panel"><div className="section-heading">SENSOR VISUAL GUIDE</div>
+ <label className="sound-toggle"><input type="checkbox" checked={showLidar} onChange={e=>setShowLidar(e.target.checked)} /> LiDAR rays / hits · blue</label>
+ <label className="sound-toggle"><input type="checkbox" checked={showDepth} onChange={e=>setShowDepth(e.target.checked)} /> RGB-D depth / camera field of view · purple</label>
+ <label className="sound-toggle"><input type="checkbox" checked={showFloor} onChange={e=>setShowFloor(e.target.checked)} /> Floor hazard scan · yellow</label>
+ <label className="sound-toggle"><input type="checkbox" checked={showMarkers} onChange={e=>setShowMarkers(e.target.checked)} /> Camera-visible ArUcos · green glow</label>
+ <p className="hint">Dots: recorded hits. Dashed red: invalid readings, not obstacles. Purple fan: nominal camera field of view, not guaranteed visibility. Scans are projected from the estimated acquisition pose.</p>
+ <p className="hint">Green markers pass geometric range, horizontal/vertical FOV, mounting-face and occlusion checks. This is not decoded RGB detection. The localization simulator uses a simpler marker model.</p>
+ {!replayFrame && <p className="hint">Run a navigation test to record sensor readings. These controls affect replay display only, not robot commands.</p>}
+ {replayFrame && !replayFrame.sensors && <p className="hint">This older replay has no sensor data. Run a new test after updating the simulator.</p>}
+ {replayFrame?.sensors && <div className="hint">LiDAR valid: {Math.round(replayFrame.sensors.lidar.valid.filter(Boolean).length/replayFrame.sensors.lidar.valid.length*100)}% · sample age: {replayFrame.sensors.lidar.age_steps} steps<br />Depth valid: {Math.round(replayFrame.sensors.depth.valid.filter(Boolean).length/replayFrame.sensors.depth.valid.length*100)}%<br />Floor valid: {Math.round(replayFrame.sensors.floor.valid.filter(Boolean).length/replayFrame.sensors.floor.valid.length*100)}%<br />Guard: {replayFrame.guard_reasons?.join(', ') || 'clear'}<br />Visible marker IDs: {replayFrame.camera_visible_marker_ids?.join(', ') || 'none'}<br />Localization update: {replayFrame.marker_localization_updated ? 'yes' : 'no'}</div>}
+ </div>
  <div className="navigation-panel"><div className="section-heading">SELECTED CHECKPOINT</div>
  <strong>{selectedModel ? modelLabel(selectedModel) : 'No model selected'}</strong>
  <p style={{overflowWrap:'anywhere',fontFamily:'monospace',fontSize:12}}>{selectedModel}</p>

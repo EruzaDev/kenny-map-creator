@@ -96,6 +96,25 @@ This serves a clearly named sample room without ROS. It is replay data, not a ph
 
 ## Test your trained model inside the editor
 
+### Toggleable sensor visual guide
+
+Run a new navigation test, then enable LiDAR, RGB-D depth/FOV, floor scan,
+or camera-visible ArUco highlights under **Sensor visual guide**. Play, pause,
+and scrub the replay to inspect individual samples. Blue/purple/yellow dots
+are recorded hits; dashed red rays are invalid readings, not obstacle hits.
+The purple sector is nominal camera field of view, not proof of clear space.
+LiDAR retains its estimated acquisition pose and sample age; other rays are
+projected from their estimated acquisition pose. Controls only affect drawing.
+
+ArUcos glow green when an offline geometric camera check passes configured
+range, horizontal/vertical FOV, surveyed marker height, visible mounting face,
+and obstacle occlusion. This is not decoded RGB detection: image resolution,
+print quality and detector errors are not simulated. The existing localization
+surrogate uses a simpler floor-marker model, so a glow does not itself imply a
+localization correction; the sidebar reports corrections separately.
+The RGB-D overlay is a top-down depth surrogate, not an RGB image or a full
+3D point cloud. Old replays remain usable but require a new test for sensor data.
+
 ### Multiple-caller scheduler preview
 
 The **Call Kenny · Simulation** panel accepts a caller name and an ArUco
