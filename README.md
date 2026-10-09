@@ -1,5 +1,7 @@
 # Kenny Environment Studio
 
+Navigation tests default to **Route recovery + marker sweep**, with an 1800-step limit. The controller selector also offers checkpoint settings for baseline comparisons. Recovery uses the existing planned route and keeps the safety shield enabled; it is not a guarantee of safe physical deployment. Replay results record the controller and enabled recovery flags. Rerun a test after changing modes. Update the sibling simulator repository along with this editor.
+
 A local browser editor for Kenny’s environment maps, printable ArUco landmarks, and obstacles. Start from a blank measured grid, a floor-plan image, a saved ROS map, or a live ROS scan. Download a reusable project or a robot/simulator export bundle.
 
 ## Run on this workstation

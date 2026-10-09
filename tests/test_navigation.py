@@ -29,14 +29,16 @@ class NavigationTests(unittest.TestCase):
         mid=models()[0]['id']
         with self.assertRaisesRegex(ValueError,'Steps'):simulate({'environment':self.environment,'model':mid,'steps':3001})
         with self.assertRaisesRegex(ValueError,'Seed'):simulate({'environment':self.environment,'model':mid,'seed':-1})
+        with self.assertRaisesRegex(ValueError,'controller'):simulate({'environment':self.environment,'model':mid,'controller':'unsafe'})
     def test_worker_result_and_argument_safety(self):
         mid=models()[0]['id']
         def run(args,**kwargs):
             output=Path(args[args.index('--output')+1]);output.write_text(json.dumps({'frames':[],'info':{'event':'timeout'}}))
             self.assertIn('kenny_rl.replay',args);self.assertNotIn('shell',kwargs)
+            self.assertEqual(args[args.index('--controller')+1],'marker-sweep')
             return type('Process',(),{'returncode':0})()
         with patch('backend.navigation.subprocess.run',side_effect=run):
-            result=simulate({'environment':self.environment,'model':mid,'steps':5})
+            result=simulate({'environment':self.environment,'model':mid,'steps':5,'controller':'marker-sweep'})
         self.assertEqual(result['model'],mid);self.assertEqual(result['info']['event'],'timeout')
 
 if __name__=='__main__':unittest.main()

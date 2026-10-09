@@ -35,6 +35,8 @@ def simulate(payload):
     steps=payload.get('steps',1200);seed=payload.get('seed',42)
     if type(steps) is not int or not 1<=steps<=3000:raise ValueError('Steps must be 1–3000')
     if type(seed) is not int or not 0<=seed<=2**32-1:raise ValueError('Seed must be an integer from 0 to 4294967295')
+    controller=payload.get('controller','checkpoint')
+    if controller not in ('checkpoint','marker-sweep'):raise ValueError('Select a supported controller mode')
     python=Path(os.environ.get('KENNY_SIM_PYTHON',str(SIMULATOR/'.venv/bin/python')))
     if not python.is_file():raise ValueError('Simulator Python missing; set KENNY_SIM_PYTHON to the environment with Torch and Stable Baselines3 installed')
     if not LOCK.acquire(blocking=False):raise ValueError('Another navigation test is running. Wait for it to finish.')
@@ -43,7 +45,7 @@ def simulate(payload):
             input_path=Path(temp)/'environment.json';output_path=Path(temp)/'replay.json'
             input_path.write_text(json.dumps(environment,allow_nan=False))
             proc=subprocess.run([str(python),'-m','kenny_rl.replay','--environment',str(input_path),
-                '--model',str(RUNS/mid),'--steps',str(steps),'--seed',str(seed),'--output',str(output_path)],
+                '--model',str(RUNS/mid),'--steps',str(steps),'--seed',str(seed),'--controller',controller,'--output',str(output_path)],
                 cwd=SIMULATOR,env={**os.environ,'MPLCONFIGDIR':temp,'OMP_NUM_THREADS':'1','MKL_NUM_THREADS':'1'},
                 capture_output=True,text=True,timeout=180)
             if proc.returncode:

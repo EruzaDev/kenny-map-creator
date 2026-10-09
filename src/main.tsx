@@ -43,6 +43,7 @@ type ReplayFrame = {
   near_goal: boolean;
 };
 type Replay = {
+  controller?: string;
   frames: ReplayFrame[];
   dt: number;
   model: string;
@@ -72,7 +73,8 @@ function App() {
   const [modelChoices, setModelChoices] = useState<ModelChoice[]>([]),
     [selectedModel, setSelectedModel] = useState(''),
     [modelError, setModelError] = useState('');
-  const [testSteps, setTestSteps] = useState(1200),
+  const [controller, setController] = useState('marker-sweep');
+  const [testSteps, setTestSteps] = useState(1800),
     [testSeed, setTestSeed] = useState(42),
     [testing, setTesting] = useState(false);
   const [calls, setCalls] = useState<CallRequest[]>([]);
@@ -150,7 +152,8 @@ function App() {
         environment: snapshot,
         model: selectedModel,
         steps: testSteps,
-        seed: testSeed
+        seed: testSeed,
+        controller
       })).json();
       if (projectRef.current !== sourceProject) {
         setMessage('The map changed during the test. Run it again to preview the current map.');
@@ -845,7 +848,9 @@ function App() {
  <div className="navigation-panel"><div className="section-heading">SELECTED CHECKPOINT</div>
  <strong>{selectedModel ? modelLabel(selectedModel) : 'No model selected'}</strong>
  <p style={{overflowWrap:'anywhere',fontFamily:'monospace',fontSize:12}}>{selectedModel}</p>
- <p className="hint">This is the selected checkpoint, not a controller-mode selector. Marker sweep is not automatically enabled.</p>
+ <label className="field">Navigation controller<select value={controller} disabled={testing} onChange={e=>setController(e.target.value)}><option value="marker-sweep">Route recovery + marker sweep</option><option value="checkpoint">Checkpoint settings (baseline)</option></select></label>
+ <p className="hint">Route recovery helps the policy realign with the planned route after a stall. The safety guard remains active; this does not guarantee passage through every gap.</p>
+ {replay && <p className="hint">Displayed replay controller: {replay.controller || 'checkpoint (legacy replay)'}. Changing this selector requires a new test.</p>}
  {replay && <><strong>Displayed replay checkpoint</strong><p style={{overflowWrap:'anywhere',fontSize:12}}>{replay.model}</p></>}
  </div>
  <div className="navigation-panel"><div className="section-heading">CALL KENNY · SIMULATION</div>
