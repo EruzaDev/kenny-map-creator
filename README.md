@@ -1,5 +1,13 @@
 # Kenny Environment Studio
 
+## Map → ESP32 USB on this device
+
+Open **Kenny Map Editor** on the desktop or **http://localhost:8000/**. Run a
+navigation test, then select **Drive ESP32 with this map** to stream its recorded
+movement commands to the physical robot. No physical sensors are required for
+this open-loop test. See [USB map drive](docs/USB_MAP_DRIVE.md) for startup,
+motor power, STOP behavior and the distinction between simulated and physical pose.
+
 Navigation tests default to **Route recovery + marker sweep**, with an 1800-step limit. The controller selector also offers checkpoint settings for baseline comparisons. Recovery uses the existing planned route and keeps the safety shield enabled; it is not a guarantee of safe physical deployment. Replay results record the controller and enabled recovery flags. Rerun a test after changing modes. Update the sibling simulator repository along with this editor.
 
 A local browser editor for Kenny’s environment maps, printable ArUco landmarks, and obstacles. Start from a blank measured grid, a floor-plan image, a saved ROS map, or a live ROS scan. Download a reusable project or a robot/simulator export bundle.
@@ -9,11 +17,11 @@ A local browser editor for Kenny’s environment maps, printable ArUco landmarks
 The frontend is built in `dist/`, and this workstation already has the Python dependencies needed by the lightweight server:
 
 ```sh
-cd /home/siege/Documents/kenny-map-editor
-python3 backend/server.py
+cd /home/kenny/kenny-map-creator
+../Kenny---Automotive-self-driving-trash-can/.venv/bin/python backend/server.py
 ```
 
-Open **http://127.0.0.1:8000**. Stop the server with Ctrl+C. The development session cannot open server sockets, so run this command in your own terminal.
+Open **http://localhost:8000**. Stop the server with Ctrl+C.
 
 The lightweight server and FastAPI adapter share exactly the same marker, import, export, and validation services. The lightweight adapter allows running offline without FastAPI; the production adapter uses FastAPI/Uvicorn.
 
@@ -35,6 +43,35 @@ cd ..
 For frontend development run `npm run dev` in another terminal. Vite proxies `/api` and its WebSocket to port 8000. This is a local application; no accounts or cloud service are required. Only bind to `0.0.0.0` when access from another device on your trusted robot network is needed.
 
 ## Editing and printing
+
+### Render map and ArUco position tools
+
+In the right sidebar, **Upload map to Render** saves your current environment
+to `https://kenny-api.onrender.com`. **Fetch map from Render** displays the actual
+stored geometry and markers with its revision/hash in a read-only preview.
+**Open fetched map in editor** opens it with Undo support, and the download
+button saves `environment.json`. The API stores uploaded maps on its persistent
+SQLite disk. Finish pending/running calls before replacing the active map.
+These controls require the updated `Kenny-Api` map endpoints to be deployed;
+`KENNY_API_URL` and `KENNY_PI_TOKEN` configure the local editor proxy if needed.
+
+**Optimize ArUco positions** suggests nearby positions that improve potential
+line-of-sight coverage from robot-reachable free floor samples. It accounts for
+occupied/unknown-cell occlusion, wall-marker facing direction, arrival clearance,
+marker spacing, and nominal camera vertical field of view. Configure the maximum
+3D movement, spacing, and camera height; select all markers or only the selected
+one. Wall heights change only when the corresponding checkbox is enabled.
+
+Click **Preview optimized ArUco positions** to show purple suggestions without
+changing the map, then **Apply optimized positions** or **Discard suggestions**.
+Apply is undoable and keeps IDs, printed sizes, and mounting types. Suggestions
+clear when the map changes. Install/survey any moved physical markers at their
+new positions before navigation, then upload the updated map to Render. The
+reported coverage is a bounded geometric estimate, not measured detector accuracy.
+
+While the API receiver is enabled, simulation playback publishes its estimated
+position to the mobile live map once per second, labeled **SIMULATED**. Disable
+the simulation receiver when the physical main controller is the pose source.
 
 For more than 50 unique landmarks, select **1,000 unique IDs · 0–999**
 under **Marker dictionary**. Existing projects default to `DICT_4X4_50`;
@@ -97,6 +134,47 @@ python3 ros/bridge.py --fixture fixtures/sample-room.json
 This serves a clearly named sample room without ROS. It is replay data, not a physical scan.
 
 ## Test your trained model inside the editor
+
+For the physical, continuously mapping **main controller**, see the sibling
+[`Kenny-Api/controller/README.md`](../Kenny-Api/controller/README.md). Export this
+editor's map as an estimated prior. The resident controller replaces observed
+geometry with SLAM evidence, corrects observed landmarks, and can reroute to a
+nearer pending call without restarting the policy or localization. Its refined
+`/kenny/map` can be viewed/captured using this editor's ROS bridge.
+
+### Receive calls from the deployed API
+
+The **API receiver · Simulation** panel connects to
+`https://kenny-api.onrender.com` through the local editor backend. Open your
+map and choose a checkpoint and controller. The receiver starts waiting
+automatically when the map has markers and a checkpoint is available. Use
+**Disconnect API receiver** to pause, or **Connect API receiver** to resume.
+Keep the page open. Scanner calls automatically select their ArUco destination,
+run the model, play the replay, and report `succeeded` only for simulated arrival
+(otherwise `failed`). The next call waits until playback reaches the end;
+pausing playback holds the queue. Calls are claimed oldest-first from the cloud,
+independently of the editor's local nearest-caller preview.
+
+The editor warms the selected PPO checkpoint once when it is selected. A resident
+simulator worker retains that policy for subsequent calls and navigation tests;
+there is no per-call Python/Torch/model startup. Switching checkpoints replaces
+the cached policy. Replay tests still compute an episode before displaying it;
+the physical main controller instead runs a continuous sensor/control loop and
+supports in-trip nearer-call preemption.
+
+Start the editor as described above; rebuild with `npm run build` after updating
+its source. The incoming ID is resolved to its location on the open editor map,
+so simulation coordinates can differ from cloud/physical coordinates. The marker
+must exist locally and its dictionary must match the call. The API must also
+recognize that ID to accept a scanner submission. Stop any physical Pi receiver
+while testing, since both consumers share the same cloud queue.
+
+Each call starts from the last simulated position; changing map geometry resets
+that position. The backend saves progress in `data/simulation-receiver.json`.
+Result-upload failures retry without repeating a trip. A backend restart marks
+an interrupted simulation failed before accepting another call. This receiver
+does not drive USB or physical motors. `KENNY_API_URL` overrides the cloud URL;
+set `KENNY_PI_TOKEN` in the backend environment if the API requires it.
 
 ### Toggleable sensor visual guide
 

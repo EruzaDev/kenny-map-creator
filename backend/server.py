@@ -1,5 +1,5 @@
 """Dependency-light HTTP/WebSocket adapter for offline development.
-Uses the same services as FastAPI. No robot command endpoints are exposed.
+Uses the same services as FastAPI, including the local USB control adapter.
 """
 import argparse
 import base64
@@ -19,7 +19,11 @@ sys.path.insert(0,str(ROOT.parent/'Kenny---Automotive-self-driving-trash-can'))
 sys.path.insert(0,str(ROOT))
 from backend.services import export_bundle, import_grid, marker_pdf, marker_image, png
 from kenny_rl.environment import validate_environment
-from backend.navigation import models, simulate
+from backend.navigation import models, simulate, warm
+from backend.usb import usb_request
+from backend.dispatch import tick, DispatchUnavailable, publish_simulation_pose
+from backend.cloud_maps import remote_map, upload, CloudMapError
+from backend.marker_optimization import optimize
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -33,6 +37,9 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers();self.wfile.write(body)
     def do_GET(self):
         path=unquote(self.path.split('?')[0])
+        if path=='/api/usb/status':
+            try:return self.respond(usb_request('status'))
+            except ValueError as e:return self.respond({'detail':str(e)},503)
         if path=='/api/live':return self.websocket()
         if path=='/api/models':return self.respond(models())
         if path.startswith('/api/markers/') and path.endswith('.png'):
@@ -44,16 +51,30 @@ class Handler(BaseHTTPRequestHandler):
         self.respond(target.read_bytes(),content_type=mimetypes.guess_type(target)[0] or 'application/octet-stream')
     def do_POST(self):
         try:
+            if self.path.startswith(('/api/usb/', '/api/dispatch/', '/api/cloud/')):
+                origin=self.headers.get('Origin')
+                if origin and origin!='http://'+self.headers.get('Host',''):
+                    return self.respond({'detail':'Commands require this editor origin'},403)
             length=int(self.headers.get('Content-Length',0))
             if not 0<length<=60_000_000:raise ValueError('Request size must be 1–60 MB')
             payload=json.loads(self.rfile.read(length))
+            if self.path.startswith('/api/usb/'):
+                return self.respond(usb_request(self.path.rsplit('/',1)[-1],payload))
             if self.path=='/api/simulate':return self.respond(simulate(payload))
+            if self.path=='/api/simulate/warm':return self.respond(warm(payload))
+            if self.path=='/api/dispatch/tick':return self.respond(tick(payload))
+            if self.path=='/api/dispatch/pose':return self.respond(publish_simulation_pose(payload))
+            if self.path=='/api/cloud/map/fetch':return self.respond(remote_map())
+            if self.path=='/api/cloud/map/upload':return self.respond(upload(payload))
+            if self.path=='/api/markers/optimize':return self.respond(optimize(payload))
             if self.path=='/api/export':return self.respond(export_bundle(payload),content_type='application/zip',filename='kenny-environment.zip')
             if self.path=='/api/import-map':return self.respond(import_grid(payload))
             if self.path=='/api/markers/pdf':
                 validate_environment(payload)
                 return self.respond(marker_pdf(payload['markers'],payload.get('markers_per_page',1),payload['dictionary']),content_type='application/pdf',filename='markers.pdf')
             self.respond({'detail':'Unknown API endpoint'},404)
+        except CloudMapError as e:self.respond({'detail':str(e)},e.status)
+        except DispatchUnavailable as e:self.respond({'detail':str(e)},503)
         except (ValueError,KeyError,TypeError,OverflowError) as e:self.respond({'detail':str(e)},422)
         except Exception as e:
             self.log_error('Request failed: %s',e);self.respond({'detail':'Request failed; check server logs'},500)

@@ -1,14 +1,72 @@
 """Local editor API. Run from the editor directory: uvicorn backend.main:app."""
 import asyncio
 from pathlib import Path
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import Response, FileResponse
 from fastapi.staticfiles import StaticFiles
 from kenny_rl.environment import validate_environment
-from .navigation import models, simulate
+from .navigation import models, simulate, warm
 from .services import marker_image, png, marker_pdf, export_bundle, import_grid
+from .usb import usb_request
+from .dispatch import tick, DispatchUnavailable, publish_simulation_pose
+from .cloud_maps import remote_map, upload, CloudMapError
+from .marker_optimization import optimize
 
 app=FastAPI(title='Kenny Environment Editor')
+
+
+@app.post('/api/cloud/map/{action}')
+def cloud_map(action:str,payload:dict,request:Request):
+    origin=request.headers.get('origin')
+    if origin and origin!=str(request.base_url).rstrip('/'):
+        raise HTTPException(403,'Commands require this editor origin')
+    try:
+        if action=='fetch':return remote_map()
+        if action=='upload':return upload(payload)
+        raise HTTPException(404,'Unknown cloud map action')
+    except CloudMapError as e:raise HTTPException(e.status,str(e))
+    except (ValueError,KeyError,TypeError) as e:raise HTTPException(422,str(e))
+
+
+@app.post('/api/markers/optimize')
+def optimize_markers(payload:dict):
+    try:return optimize(payload)
+    except (ValueError,KeyError,TypeError) as e:raise HTTPException(422,str(e))
+
+
+@app.post('/api/dispatch/tick')
+def receive_call(payload:dict,request:Request):
+    origin=request.headers.get('origin')
+    if origin and origin!=str(request.base_url).rstrip('/'):
+        raise HTTPException(403,'Commands require this editor origin')
+    try:return tick(payload)
+    except DispatchUnavailable as e:raise HTTPException(503,str(e))
+    except (ValueError,KeyError,TypeError) as e:raise HTTPException(422,str(e))
+
+
+@app.post('/api/dispatch/pose')
+def simulation_position(payload:dict,request:Request):
+    origin=request.headers.get('origin')
+    if origin and origin!=str(request.base_url).rstrip('/'):
+        raise HTTPException(403,'Commands require this editor origin')
+    try:return publish_simulation_pose(payload)
+    except DispatchUnavailable as e:raise HTTPException(503,str(e))
+    except (ValueError,KeyError,TypeError) as e:raise HTTPException(422,str(e))
+
+
+@app.get('/api/usb/status')
+def usb_status():
+    try:return usb_request('status')
+    except ValueError as e:raise HTTPException(503,str(e))
+
+
+@app.post('/api/usb/{action}')
+def usb_command(action:str,payload:dict,request:Request):
+    origin=request.headers.get('origin')
+    if origin and origin!=str(request.base_url).rstrip('/'):
+        raise HTTPException(403,'USB commands require this editor origin')
+    try:return usb_request(action,payload)
+    except ValueError as e:raise HTTPException(422,str(e))
 
 
 @app.get('/api/markers/{mid}.png')
@@ -74,4 +132,10 @@ def model_list():
 @app.post('/api/simulate')
 def navigation_test(payload:dict):
     try:return simulate(payload)
+    except (ValueError,KeyError,TypeError) as e:raise HTTPException(422,str(e))
+
+
+@app.post('/api/simulate/warm')
+def warm_model(payload:dict):
+    try:return warm(payload)
     except (ValueError,KeyError,TypeError) as e:raise HTTPException(422,str(e))

@@ -19,6 +19,7 @@ class NavigationTests(unittest.TestCase):
             (p.parent/'config.json').write_text(json.dumps({'environment':{'stage':stage}}))
             (p.parent/'contract.json').write_text('{}')
         patcher=patch('backend.navigation.RUNS',runs);patcher.start();self.addCleanup(patcher.stop)
+        releases=patch('backend.navigation.RELEASES',runs/'releases');releases.start();self.addCleanup(releases.stop)
         python=patch.dict('os.environ',{'KENNY_SIM_PYTHON':sys.executable});python.start();self.addCleanup(python.stop)
     def test_model_inventory_contains_existing_runs(self):
         inventory=models();self.assertTrue(inventory)
@@ -30,14 +31,28 @@ class NavigationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'Steps'):simulate({'environment':self.environment,'model':mid,'steps':3001})
         with self.assertRaisesRegex(ValueError,'Seed'):simulate({'environment':self.environment,'model':mid,'seed':-1})
         with self.assertRaisesRegex(ValueError,'controller'):simulate({'environment':self.environment,'model':mid,'controller':'unsafe'})
+    def test_release_inventory_and_checkpoint_resolution(self):
+        from backend.navigation import RELEASES
+        checkpoint=RELEASES/'dynamic/model/best.zip';checkpoint.parent.mkdir(parents=True)
+        checkpoint.write_bytes(b'fixture')
+        (checkpoint.parent/'config.json').write_text(json.dumps({'environment':{'stage':'dynamic'}}))
+        (checkpoint.parent/'contract.json').write_text('{}')
+        mid='releases/dynamic/model/best.zip'
+        self.assertTrue(any(m['id']==mid for m in models()))
+        def run(python,simulator,packet):
+            self.assertEqual(packet['model'],str(checkpoint.resolve()))
+            Path(packet['output']).write_text(json.dumps({'frames':[],'info':{}}))
+            return {'ok':True}
+        with patch('backend.navigation.WORKER.request',side_effect=run):
+            simulate({'environment':self.environment,'model':mid,'steps':1})
     def test_worker_result_and_argument_safety(self):
         mid=models()[0]['id']
-        def run(args,**kwargs):
-            output=Path(args[args.index('--output')+1]);output.write_text(json.dumps({'frames':[],'info':{'event':'timeout'}}))
-            self.assertIn('kenny_rl.replay',args);self.assertNotIn('shell',kwargs)
-            self.assertEqual(args[args.index('--controller')+1],'marker-sweep')
-            return type('Process',(),{'returncode':0})()
-        with patch('backend.navigation.subprocess.run',side_effect=run):
+        def run(python,simulator,packet):
+            Path(packet['output']).write_text(json.dumps({'frames':[],'info':{'event':'timeout'}}))
+            self.assertEqual(packet['operation'],'replay')
+            self.assertEqual(packet['controller'],'marker-sweep')
+            return {'ok':True}
+        with patch('backend.navigation.WORKER.request',side_effect=run):
             result=simulate({'environment':self.environment,'model':mid,'steps':5,'controller':'marker-sweep'})
         self.assertEqual(result['model'],mid);self.assertEqual(result['info']['event'],'timeout')
 

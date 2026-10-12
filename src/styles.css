@@ -481,3 +481,7 @@ footer {
 .sound-toggle { display:flex; align-items:center; gap:7px; font-size:11px; color:#63786a; margin-bottom:15px; }
 .proximity { padding:6px 8px; margin:8px 0; border-radius:5px; background:#e4eee7; }
 .proximity.near { background:#d7efe0; color:#09784e; font-weight:600; }
+/* Read-only geometry returned by the deployed map API. */
+.cloud-map-preview { margin: 12px 0; }
+.cloud-map-preview svg { display: block; width: 100%; max-height: 260px; border: 1px solid #b4c9be; background: #f8faf8; }
+.cloud-map-preview figcaption { margin-top: 8px; font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; color: #47565e; }

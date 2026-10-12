@@ -11,6 +11,17 @@ import type { CallRequest } from './scheduler';
 import { modelLabel } from './model-label';
 import { SensorOverlay } from './sensor-overlay';
 import type { SensorFrame } from './sensor-geometry';
+import { UsbReplayControl } from './UsbReplayControl';
+import { CloudMapPreview } from './CloudMapPreview';
+import type { CloudMap } from './CloudMapPreview';
+type MarkerOptimization = {
+  markers: Marker[];
+  changes: { id: number; before: Marker; after: Marker; visible_samples_before: number; visible_samples_after: number }[];
+  coverage_before_percent: number;
+  coverage_after_percent: number;
+  sample_count: number;
+  detail: string;
+};
 type Live = {
   type: 'map';
   revision: number;
@@ -29,6 +40,7 @@ type ModelChoice = {
   bytes: number;
 };
 type ReplayFrame = {
+  command?: { v: number; w: number };
   camera_visible_marker_ids?: number[];
   marker_localization_updated?: boolean;
   sensors?: SensorFrame;
@@ -83,11 +95,27 @@ function App() {
   const [activeCall, setActiveCall] = useState<CallRequest | null>(null);
   const [dispatchPosition, setDispatchPosition] = useState<[number, number] | null>(null);
   const dispatchBusy = useRef(false);
+  const [receiverEnabled, setReceiverEnabled] = useState(true);
+  const [receiverStatus, setReceiverStatus] = useState('Loading model — receiver will wait for incoming calls');
+  const receiverPoll = useRef<() => Promise<void>>(async () => {});
+  const posePoll = useRef<() => Promise<void>>(async () => {});
+  const poseBusy = useRef(false);
+  const [posePublishStatus, setPosePublishStatus] = useState('');
+  const receiverLease = useRef(false);
+  const [modelReady, setModelReady] = useState(false);
+  const [cloudMap, setCloudMap] = useState<CloudMap | null>(null);
+  const [markerOptimization, setMarkerOptimization] = useState<{ source: Project; result: MarkerOptimization } | null>(null);
+  const [maximumMarkerShift, setMaximumMarkerShift] = useState(1.5);
+  const [markerSpacing, setMarkerSpacing] = useState(.6);
+  const [optimizationCameraHeight, setOptimizationCameraHeight] = useState(.4);
+  const [adjustWallHeight, setAdjustWallHeight] = useState(false);
+  const [optimizeSelectedOnly, setOptimizeSelectedOnly] = useState(false);
   const [replay, setReplay] = useState<Replay | null>(null),
     [frameIndex, setFrameIndex] = useState(0),
     [playing, setPlaying] = useState(false),
     [playSpeed, setPlaySpeed] = useState(2);
   const [nearSoundEnabled, setNearSoundEnabled] = useState(true);
+  const [usbDriving, setUsbDriving] = useState(false);
   const [showLidar,setShowLidar]=useState(false);
   const [showDepth,setShowDepth]=useState(false);
   const [showFloor,setShowFloor]=useState(false);
@@ -107,6 +135,18 @@ function App() {
     }).catch(() => setModelError('Start the backend server to load your trained models.'));
   }, []);
   useEffect(() => {
+    if (!selectedModel) return;
+    let cancelled = false;
+    setModelReady(false);
+    setReceiverStatus('Loading and warming model once…');
+    void requestFile('/api/simulate/warm', { model: selectedModel }).then(() => {
+      if (!cancelled) { setModelReady(true); setReceiverStatus('Model resident — waiting for an ArUco call'); }
+    }).catch(error => {
+      if (!cancelled) setReceiverStatus(error instanceof Error ? error.message : 'Model warmup failed');
+    });
+    return () => { cancelled = true; };
+  }, [selectedModel]);
+  useEffect(() => {
     setReplay(null);
     setPlaying(false);
     setFrameIndex(0);
@@ -114,6 +154,7 @@ function App() {
     setCalls([]);
     setActiveCall(null);
     setDispatchPosition(null);
+    setMarkerOptimization(null);
   }, [project]);
   useEffect(() => {
     if (!playing || !replay) return;
@@ -129,6 +170,7 @@ function App() {
     void nearAnnouncement.current!.playIfNear(replayFrame.distance_to_destination_m).catch(() => setMessage('Audio could not play. Enable sound and press Play to try again.'));
   }, [playing, nearSoundEnabled, replayFrame]);
   async function runNavigation(call?: CallRequest) {
+    if (usbDriving) return;
     if (dispatchBusy.current) return;
     if (!call && project.destination_marker_id == null) {
       setMessage('Choose a destination ArUco marker first.');
@@ -204,6 +246,82 @@ function App() {
     [viewLive, setViewLive] = useState(false),
     [now, setNow] = useState(Date.now());
   const [opacity, setOpacity] = useState(.45);
+  posePoll.current = async () => {
+    if (!receiverEnabled || !receiverLease.current || !replayFrame || !replay || usbDriving || poseBusy.current) return;
+    poseBusy.current = true;
+    try {
+      await requestFile('/api/dispatch/pose', {
+        pose: { frame_id: 'map', x: replayFrame.pose[0], y: replayFrame.pose[1], yaw: replayFrame.pose[2] },
+        goal: { x: replay.goal[0], y: replay.goal[1], marker_id: replay.destination_marker_id },
+        route: replayFrame.route, playing
+      });
+      setPosePublishStatus('Simulation position is publishing to the mobile live map');
+    } catch (error) { setPosePublishStatus(error instanceof Error ? `Live map: ${error.message}` : 'Live position upload unavailable'); }
+    finally { poseBusy.current = false; }
+  };
+  useEffect(() => {
+    if (!receiverEnabled || !replay) return;
+    void posePoll.current();
+    const timer = setInterval(() => void posePoll.current(), 1000);
+    return () => clearInterval(timer);
+  }, [receiverEnabled, Boolean(replay)]);
+  receiverPoll.current = async () => {
+    if (!receiverEnabled || !receiverLease.current || dispatchBusy.current || busy || usbDriving || viewLive || calibrating || !selectedModel || !modelReady ||
+        (replay && frameIndex < replay.frames.length - 1)) return;
+    if (!project.markers.length) {
+      setReceiverStatus('Open your API map with ArUco markers to begin waiting for calls');
+      return;
+    }
+    dispatchBusy.current = true;
+    const sourceProject = project;
+    setReceiverStatus('Checking API / running incoming simulation…');
+    setTesting(true);
+    try {
+      const response: { job: { marker_id: number } | null; replay?: Replay | null; detail: string; status?: string } =
+        await (await requestFile('/api/dispatch/tick', {
+          environment: project, model: selectedModel, steps: testSteps, seed: testSeed, controller
+        })).json();
+      setReceiverStatus(response.job ? `ArUco ID ${response.job.marker_id}: ${response.detail}` : response.detail);
+      if (response.replay && projectRef.current === sourceProject) {
+        nearAnnouncement.current!.reset();
+        setReplay(response.replay);
+        setFrameIndex(0);
+        setPlaying(true);
+        const pose = response.replay.frames[response.replay.frames.length - 1].pose;
+        setDispatchPosition([pose[0], pose[1]]);
+        setMessage(`API call · ArUco ID ${response.job!.marker_id}: ${response.detail}`);
+      } else if (response.job) {
+        setMessage(response.detail);
+      }
+    } catch (error) {
+      setReceiverStatus(error instanceof Error ? error.message : 'Receiver unavailable; retrying');
+    } finally {
+      setTesting(false);
+      dispatchBusy.current = false;
+    }
+  };
+  useEffect(() => {
+    if (!receiverEnabled) return;
+    let stopped = false;
+    let release = () => {};
+    async function listen() {
+      if (stopped) return;
+      receiverLease.current = true;
+      void receiverPoll.current();
+      const timer = setInterval(() => void receiverPoll.current(), 5000);
+      await new Promise<void>(resolve => { release = resolve; });
+      clearInterval(timer);
+      receiverLease.current = false;
+    }
+    if (navigator.locks) {
+      void navigator.locks.request('kenny-simulation-receiver', async () => {
+        if (!stopped) await listen();
+      });
+    } else {
+      void listen();
+    }
+    return () => { stopped = true; release(); };
+  }, [receiverEnabled]);
   const svg = useRef<SVGSVGElement>(null),
     socket = useRef<WebSocket | null>(null),
     drag = useRef<{
@@ -497,6 +615,42 @@ function App() {
       setBusy(false);
     }
   }
+  async function fetchCloudMap() {
+    const result: CloudMap = await (await requestFile('/api/cloud/map/fetch', {})).json();
+    validateProject(result.environment);
+    setCloudMap(result);
+    setMessage(`Fetched “${result.environment.name || 'Render map'}” · revision ${result.revision}. See the Render map preview.`);
+  }
+  async function uploadCloudMap() {
+    const snapshot = project;
+    const result: CloudMap = await (await requestFile('/api/cloud/map/upload', {
+      environment: snapshot, ...(cloudMap ? { expected_sha256: cloudMap.sha256 } : {})
+    })).json();
+    setCloudMap(result);
+    setMessage(`Uploaded “${snapshot.name}” to Render · revision ${result.revision}. Scanner destinations now use this map.`);
+  }
+  function openCloudMap() {
+    if (!cloudMap) return;
+    const next = validateProject(structuredClone(cloudMap.environment));
+    for (const marker of next.markers) marker.uid ||= newUid();
+    for (const obstacle of next.obstacles) obstacle.uid ||= newUid();
+    commit(next);
+    setSelected(null); setViewLive(false); setPan([0, 0]); setZoom(1);
+    setMessage('Fetched Render map opened. Undo returns to your previous map.');
+  }
+  async function previewMarkerOptimization() {
+    const source = project;
+    const marker = selected?.kind === 'marker' ? project.markers.find(m => m.uid === selected.uid) : null;
+    if (optimizeSelectedOnly && !marker) throw Error('Select an ArUco on the map first.');
+    const result: MarkerOptimization = await (await requestFile('/api/markers/optimize', {
+      environment: source, max_shift_m: maximumMarkerShift, min_spacing_m: markerSpacing,
+      camera_height_m: optimizationCameraHeight, adjust_wall_height: adjustWallHeight,
+      ...(optimizeSelectedOnly ? { marker_ids: [marker!.id] } : {})
+    })).json();
+    if (projectRef.current !== source) throw Error('Map changed while optimizing. Preview positions again.');
+    setMarkerOptimization({ source, result });
+    setMessage(`${result.changes.length} marker suggestions. Estimated visibility coverage: ${result.coverage_before_percent}% → ${result.coverage_after_percent}%.`);
+  }
   async function save() {
     const z = new JSZip();
     const {
@@ -730,11 +884,11 @@ function App() {
             setCalibrating(false);
             setCalPoints([]);
           }}>Cancel</button></div>}
- {replay && <div className="replay-controls"><button onClick={() => {
+  {replay && <div className="replay-controls"><button disabled={usbDriving} onClick={() => {
             if (!playing && nearSoundEnabled) void nearAnnouncement.current!.enable().catch(() => setMessage('Audio could not be enabled.'));
             if (frameIndex === replay.frames.length - 1) setFrameIndex(0);
             setPlaying(v => !v);
-          }}>{playing ? 'Pause' : 'Play'}</button><input aria-label="Replay position" type="range" min="0" max={replay.frames.length - 1} value={frameIndex} onChange={e => {
+          }}>{playing ? 'Pause' : 'Play'}</button><input disabled={usbDriving} aria-label="Replay position" type="range" min="0" max={replay.frames.length - 1} value={frameIndex} onChange={e => {
             setPlaying(false);
             setFrameIndex(Number(e.target.value));
           }} /><span>{(frameIndex * replay.dt).toFixed(1)} / {((replay.frames.length - 1) * replay.dt).toFixed(1)} s</span><select aria-label="Playback speed" value={playSpeed} onChange={e => setPlaySpeed(Number(e.target.value))}><option value={1}>1×</option><option value={2}>2×</option><option value={5}>5×</option></select><button onClick={() => {
@@ -793,7 +947,12 @@ function App() {
                 s = Math.max(.3, m.size);
               return <g key={m.uid} data-kind="marker" data-uid={m.uid} transform={`translate(${p[0]},${p[1]})`}><g transform={`rotate(${-(m.yaw - grid.origin[2]) * 180 / Math.PI})`}><rect x={-s / 2 - .04} y={-s / 2 - .04} width={s + .08} height={s + .08} rx=".025" fill={selected?.uid === m.uid ? '#0b8b69' : '#fff'} stroke="#0b8b69" strokeWidth=".015" /><image href={`/api/markers/${m.id}.png?dictionary=${project.dictionary}`} x={-s / 2} y={-s / 2} width={s} height={s} /><path d={`M 0 ${-s / 2 - .06} l -.04 .07 h .08 Z`} fill="#0b8b69" /></g><text y={s / 2 + .2} textAnchor="middle" fontSize=".15" fill="#11694f">ID {m.id} · {m.mount}</text></g>;
             })}
- {!viewLive && (['start', 'goal'] as const).filter(k => k === 'start' || project.destination_marker_id != null).map(k => {
+  {!viewLive && markerOptimization?.source === project && <g pointerEvents="none" aria-label="Suggested ArUco positions">{markerOptimization.result.changes.map(change => {
+    const before = visual([change.before.x, change.before.y]), after = visual([change.after.x, change.after.y]);
+    const facing = visual([change.after.x + Math.cos(change.after.yaw) * .4, change.after.y + Math.sin(change.after.yaw) * .4]);
+    return <g key={change.id} data-marker-optimization-id={change.id}><line x1={before[0]} y1={before[1]} x2={after[0]} y2={after[1]} stroke="#8956bd" strokeWidth=".04" strokeDasharray=".1 .06" /><circle cx={after[0]} cy={after[1]} r=".25" fill="#8956bd" fillOpacity=".15" stroke="#8956bd" strokeWidth=".035" /><line x1={after[0]} y1={after[1]} x2={facing[0]} y2={facing[1]} stroke="#8956bd" strokeWidth=".035" /><text x={after[0] + .3} y={after[1]} fill="#7543a9" fontSize=".17">ID {change.id} suggestion</text></g>;
+  })}</g>}
+  {!viewLive && (['start', 'goal'] as const).filter(k => k === 'start' || project.destination_marker_id != null).map(k => {
               const p = visual(project[k]);
               return <g key={k} data-kind={k} data-uid={k} transform={`translate(${p[0]},${p[1]})`}><circle r={k === 'start' ? .19 : .25} fill={k === 'start' ? '#198e71' : 'none'} stroke={k === 'start' ? 'white' : '#eea247'} strokeWidth=".04" pointerEvents={k === 'goal' ? 'visibleStroke' : 'auto'} />{k === 'start' && <text y=".05" textAnchor="middle" fontSize=".15" fill="white">K</text>}<text y={k === 'start' ? .4 : .6} textAnchor="middle" fontSize=".15" fill="#47565e">{k === 'start' ? 'KENNY' : `DESTINATION · ID ${project.destination_marker_id}`}</text></g>;
             })}
@@ -834,7 +993,8 @@ function App() {
             });
           }} />)}</> : <div className="empty-properties"><span>↖</span><strong>Select an object</strong><p>Click a marker or obstacle to edit its position and dimensions.</p></div>}
  {project.background && <label className="field separated">Floor plan opacity<input type="range" min="0" max="1" step=".05" value={opacity} onChange={e => setOpacity(Number(e.target.value))} /></label>}
- <div className="navigation-panel"><div className="section-heading">SENSOR VISUAL GUIDE</div>
+  <UsbReplayControl replay={replay} onFrame={setFrameIndex} onDriving={active => {setUsbDriving(active);if(active)setPlaying(false);}} />
+  <div className="navigation-panel"><div className="section-heading">SENSOR VISUAL GUIDE</div>
  <label className="sound-toggle"><input type="checkbox" checked={showLidar} onChange={e=>setShowLidar(e.target.checked)} /> LiDAR rays / hits · blue</label>
  <label className="sound-toggle"><input type="checkbox" checked={showDepth} onChange={e=>setShowDepth(e.target.checked)} /> RGB-D depth / camera field of view · purple</label>
  <label className="sound-toggle"><input type="checkbox" checked={showFloor} onChange={e=>setShowFloor(e.target.checked)} /> Floor hazard scan · yellow</label>
@@ -853,7 +1013,45 @@ function App() {
  {replay && <p className="hint">Displayed replay controller: {replay.controller || 'checkpoint (legacy replay)'}. Changing this selector requires a new test.</p>}
  {replay && <><strong>Displayed replay checkpoint</strong><p style={{overflowWrap:'anywhere',fontSize:12}}>{replay.model}</p></>}
  </div>
- <div className="navigation-panel"><div className="section-heading">CALL KENNY · SIMULATION</div>
+  <div className="navigation-panel"><div className="section-heading">RENDER MAP</div>
+  <h2>Upload and inspect your map</h2>
+  <p className="hint">https://kenny-api.onrender.com · The active map is stored with the server queue and survives restarts.</p>
+  <button className="full primary" disabled={busy || testing || usbDriving || viewLive || !project.markers.length} onClick={() => void task(uploadCloudMap)}>Upload map to Render</button>
+  <button className="full" disabled={busy || testing || usbDriving} onClick={() => void task(fetchCloudMap)}>Fetch map from Render</button>
+  {cloudMap && <><CloudMapPreview map={cloudMap} /><button className="full" disabled={busy || testing || usbDriving} onClick={openCloudMap}>Open fetched map in editor</button><button className="full" onClick={() => download(new Blob([JSON.stringify(cloudMap.environment, null, 2)], { type: 'application/json' }), 'render-environment.json')}>Download fetched environment.json</button></>}
+  <p className="hint">Upload uses the current editor geometry and markers. Finish pending/running calls before replacing the server map. Fetch shows a read-only preview; Open is undoable.</p>
+  </div>
+  <div className="navigation-panel"><div className="section-heading">OPTIMIZE ARUCO POSITIONS</div>
+  <h2>Improve marker coverage</h2>
+  <p className="hint">Suggest nearby positions with better visibility from reachable floor space. IDs, printed sizes, and mounting types are preserved.</p>
+  <div className="dimensions"><Field label="Maximum marker shift · m" value={maximumMarkerShift} onChange={setMaximumMarkerShift} min={.1} max={5} step={.1} /><Field label="Minimum marker spacing · m" value={markerSpacing} onChange={setMarkerSpacing} min={.1} max={3} step={.1} /></div>
+  <Field label="Optimization camera height · m" value={optimizationCameraHeight} onChange={setOptimizationCameraHeight} min={.05} max={2} step={.05} />
+  <label className="sound-toggle"><input type="checkbox" checked={optimizeSelectedOnly} onChange={e => setOptimizeSelectedOnly(e.target.checked)} /> Optimize selected marker only</label>
+  <label className="sound-toggle"><input type="checkbox" checked={adjustWallHeight} onChange={e => setAdjustWallHeight(e.target.checked)} /> Adjust wall-marker heights to camera height</label>
+  <button className="full primary" disabled={busy || testing || usbDriving || viewLive || !project.markers.length || (optimizeSelectedOnly && selected?.kind !== 'marker')} onClick={() => void task(previewMarkerOptimization)}>Preview optimized ArUco positions</button>
+  {markerOptimization && <><p role="status">Estimated visibility coverage: {markerOptimization.result.coverage_before_percent}% → {markerOptimization.result.coverage_after_percent}% · {markerOptimization.result.changes.length} suggestions</p>
+  <p className="hint">Purple circles show suggestions. {markerOptimization.result.detail}</p>
+  <ul>{markerOptimization.result.changes.map(change => <li key={change.id}>ID {change.id}: ({change.after.x.toFixed(2)}, {change.after.y.toFixed(2)}) m · height {change.after.z.toFixed(2)} m</li>)}</ul>
+  <button className="full primary" disabled={busy || testing || usbDriving || markerOptimization.source !== project || !markerOptimization.result.changes.length} onClick={() => {
+    const result = markerOptimization.result;
+    commit(validateProject({ ...project, markers: result.markers }));
+    setMessage(`Applied ${result.changes.length} ArUco position suggestions. Undo restores the original positions.`);
+  }}>Apply optimized positions</button><button className="full" onClick={() => setMarkerOptimization(null)}>Discard suggestions</button></>}
+  <p className="hint">Design-time guidance using the estimated map and nominal camera field of view, not a measured pose correction. Installed markers must match any applied positions. Upload afterward to update Render.</p>
+  </div>
+  <div className="navigation-panel"><div className="section-heading">API RECEIVER · SIMULATION</div>
+  <h2>Receive scanner calls</h2>
+  <p className="hint">https://kenny-api.onrender.com · Incoming IDs automatically run the selected model on this map and play the trip. Calls run oldest-first, one at a time. Keep this page open; the next trip waits for playback to finish.</p>
+  <p role="status">{receiverStatus}</p>
+  {posePublishStatus && <p className="hint">{posePublishStatus}. Simulation data is labeled separately from physical pose estimates.</p>}
+  <button className="full primary" disabled={!receiverEnabled && (!selectedModel || viewLive || calibrating || usbDriving || testing)} onClick={() => {
+    setReceiverEnabled(enabled => !enabled);
+    if (receiverEnabled) setReceiverStatus('Disconnected — current simulation/result upload will finish');
+    else if (nearSoundEnabled) void nearAnnouncement.current!.enable().catch(() => setMessage('Audio unavailable; simulation will still run.'));
+  }}>{receiverEnabled ? 'Disconnect API receiver' : 'Connect API receiver'}</button>
+  <p className="hint">IDs are resolved to marker locations on your open simulation map. Use the same marker dictionary as the scanner. No physical motor commands are sent. Stop the Pi receiver while using the simulation receiver.</p>
+  </div>
+  <div className="navigation-panel"><div className="section-heading">CALL KENNY · SIMULATION</div>
  <h2>Nearest caller queue</h2><p className="hint">Calls wait until the current trip finishes. Ranking uses straight-line arrival distance, not route length. After 5 minutes, oldest waiting calls take priority. Session-only queue; map edits clear it. This does not send commands to a physical robot.</p>
  <label className="field">Caller name<input maxLength={80} value={callerName} onChange={e => setCallerName(e.target.value)} placeholder="Student / desk name" /></label>
  <label className="field">Caller location<select value={callerMarker} onChange={e => setCallerMarker(e.target.value)}><option value="">Choose an ArUco location…</option>{project.markers.map(m => <option key={m.uid} value={m.id}>ArUco ID {m.id}</option>)}</select></label>
