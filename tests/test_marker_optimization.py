@@ -73,6 +73,14 @@ class MarkerOptimizationTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 optimize({'environment': environment, **change})
 
+    def test_virtual_no_go_boundary_is_not_a_wall_mounting_candidate(self):
+        environment = room()
+        environment['obstacles'] = [{'kind': 'prohibited', 'x': 2.5, 'y': 1.5, 'width': 1., 'depth': 1., 'bottom': 0., 'height': 1.}]
+        marker = {**environment['markers'][0], 'x': 3.7, 'y': 2., 'z': .4, 'mount': 'wall'}
+        placement = Placement(environment, .4, 2.5)
+        candidates = placement.candidates(marker, .5, False, 32)
+        self.assertEqual(candidates, [marker])
+
 
 if __name__ == '__main__':
     unittest.main()

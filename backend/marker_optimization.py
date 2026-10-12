@@ -14,6 +14,9 @@ class Placement:
         self.environment = environment
         self.grid = environment['grid']
         self.occupancy = rasterize(environment)
+        # A semantic no-go rectangle is not a physical surface to mount a marker.
+        wall_environment = {**environment, 'obstacles': [o for o in environment.get('obstacles', []) if o['kind'] != 'prohibited']}
+        self.wall_occupancy = rasterize(wall_environment)
         self.resolution = self.grid['resolution']
         padded = np.pad((self.occupancy == 0).astype(np.uint8), 1)
         clearance = cv2.distanceTransform(padded, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)[1:-1, 1:-1] * self.resolution
@@ -97,7 +100,7 @@ class Placement:
             cx, cy = self.cell([marker['x'], marker['y']])
             for y in range(max(0, cy - radius), min(self.grid['height'], cy + radius + 1)):
                 for x in range(max(0, cx - radius), min(self.grid['width'], cx + radius + 1)):
-                    if self.occupancy[y, x] != 100:
+                    if self.wall_occupancy[y, x] != 100:
                         continue
                     for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
                         neighbor = x + dx, y + dy
