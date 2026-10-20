@@ -38,7 +38,7 @@ class Routes(unittest.TestCase):
         source.update_map(env['grid']);source.update_pose([0,0,0]);snap=source.snapshot()
         source.update_map({**env['grid'],'origin':[0,0,0]})
         self.assertEqual(snap['grid']['origin'],[-2,-1,0]);self.assertGreater(source.snapshot()['revision'],snap['revision'])
-        with patch('ros.bridge.time.time',return_value=source.updated+10):self.assertGreaterEqual(source.snapshot()['map_age_seconds'],10)
+        with patch('ros.bridge.time.monotonic',return_value=source.updated+10):self.assertGreaterEqual(source.snapshot()['map_age_seconds'],10)
 
 if __name__=='__main__':unittest.main()
 

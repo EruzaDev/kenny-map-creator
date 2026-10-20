@@ -14,6 +14,7 @@ from .navigation import simulate, models
 from kenny_rl.environment import validate_environment
 
 STATE = Path(__file__).resolve().parents[1] / 'data/simulation-receiver.json'
+DEPLOYMENT = Path(__file__).resolve().parents[2] / 'Kenny-Api/data/deployment.json'
 LOCK = threading.Lock()
 
 
@@ -58,6 +59,7 @@ def destination(environment, job):
 
 
 def publish_simulation_pose(payload):
+    require_simulation_mode()
     route = payload.get('route', [])
     if len(route) > 200:
         route = [route[int(i * (len(route) - 1) / 199)] for i in range(200)]
@@ -84,6 +86,7 @@ def tick(payload):
 
 
 def consume(payload):
+    require_simulation_mode()
     state = json.loads(STATE.read_text()) if STATE.exists() else {'phase': 'idle'}
     if state['phase'] == 'running':
         # A simulator process crash cannot be interpreted as arrival.
@@ -122,3 +125,8 @@ def consume(payload):
     result = {'job': state['job'], 'replay': state.get('replay'), **state['outcome']}
     save({'phase': 'idle', 'position': state.get('position'), 'map': state['map']})
     return result
+
+
+def require_simulation_mode():
+    if DEPLOYMENT.exists() and json.loads(DEPLOYMENT.read_text()).get('mode') == 'robot':
+        raise ValueError('Robot mode is active. Switch to Simulation in the operations dashboard before connecting the simulation receiver.')

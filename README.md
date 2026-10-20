@@ -52,6 +52,18 @@ stored geometry and markers with its revision/hash in a read-only preview.
 **Open fetched map in editor** opens it with Undo support, and the download
 button saves `environment.json`. The API stores uploaded maps on its persistent
 SQLite disk. Finish pending/running calls before replacing the active map.
+
+When live scanning is displayed, the upload button first offers **Return to editor
+to upload your map**. This reveals the saved editor project for review without
+uploading the live raster or overwriting browser work. Click **Upload map to Render**
+again to upload that project. A measured raster must first be captured with
+**Capture map for editing** if that is what you want to upload. Geometry-only maps
+can be uploaded without ArUcos; registered destinations are still needed for calls.
+
+Upload errors and progress are shown beside the button. **Check pending Render
+calls** and the upload preflight identify queued/running IDs that block map
+replacement. These checks never claim/cancel calls automatically. Server validation
+and revision-hash checks remain authoritative if the queue/map changes concurrently.
 These controls require the updated `Kenny-Api` map endpoints to be deployed;
 `KENNY_API_URL` and `KENNY_PI_TOKEN` configure the local editor proxy if needed.
 
@@ -293,3 +305,89 @@ To turn a downloaded replay into a shareable animation:
 python3 scripts/render_replay.py --environment /path/environment.json \
   --replay /path/kenny-navigation-replay.json --output navigation.gif
 ```
+## Live Kenny pose and measured LiDAR
+
+### Place Kenny on the editor map and compare real scans
+
+Click **Place Kenny on editor map**, then click Kenny's approximate position.
+The green robot is a separate placement preview: drag it or edit **Kenny X/Y**,
+adjust heading numerically or in five-degree steps, and compare the blue measured
+scan hits/rays against the drawn walls. The placement creates a rigid source-frame
+to-editor-frame transform; subsequent SLAM/odometry movement follows that alignment.
+Changing position or heading transforms the scan overlay as well. It never edits
+the saved project start or sends a motor command. Until explicitly applied, it
+also does not change live localization.
+
+**Apply pose to robot/map** sends your current placement to the ROS bridge. STOP
+must be latched and stationary wheel feedback confirmed. The bridge verifies
+that editor geometry/markers match Render, that the map hash and live session
+are current, and that the source pose has not changed. Autonomous navigation
+must be paused; scan-only SLAM can continue. Accepted placement initializes
+`map -> slam_map`, transforms the live raster origin, and updates map-frame
+Kenny/scans. The operator-initialized pose is explicitly labeled approximate;
+absolute accuracy is not independently verified, and no artificial covariance
+or collision clearance is supplied. A background tracker sends fresh placed
+map poses to Render, reporting authentication/ownership/map-change errors.
+
+This anchor lasts for the current live mapping session. Autonomous localization
+takeover or an uploaded-map change withdraws the operator anchor. Applying pose
+does not release STOP, start a mission, mark arrival, or issue a wheel command.
+The operations dashboard requires a current reference rather than accepting
+orphaned cached map transforms as fresh localization.
+
+**Suggest nearby scan alignment** searches ±0.5 m / ±20 degrees around the current
+placement for better measured-hit agreement with physical walls and obstacles
+at LiDAR height. It reports the sampled-hit fit and clipped mismatch. No-go areas
+are not physical matching features, unknown scan returns are not invented, and a
+poor fit is rejected. The suggestion remains a visual preview for operator review,
+not localization certainty or collision clearance. Keep Kenny stationary while
+adjusting for the best comparison. Fresh, synchronized pose/scan data are required.
+Clear the preview or reconnect/re-place when the live frame/session changes.
+
+On the Pi's map creator (`http://localhost:8001` through SSH), the live bridge
+connects automatically. The **LIVE KENNY POSITION + LIDAR** panel shows measured
+pose source, coordinate frame, age, heading and available uncertainty. Green
+Kenny/heading and blue scan hits are overlaid when the pose/scan frame matches the
+displayed map. The overlay controls independently toggle pose, hit points and rays.
+Stale poses are gray and labeled stale; expired scans are not shown as current.
+The saved project start and simulator replay are not physical localization inputs.
+
+**PROVISIONAL ARUCO SPACING** compares two or more markers detected in the same
+fresh RGB-D frame. It anchors the lowest visible ID (or a selected visible
+marker) at its saved map position and plots dashed purple estimates for other
+visible markers along their existing map bearings, using measured separation
+and the mapped height difference. The panel lists measured versus saved spacing.
+The marker coordinates in the project, exports, navigation goals and Render map
+are **not changed**: this is an approximate visual guide for checking physical
+placement, not a surveyed marker adjustment. It disappears when the depth pair
+is no longer fresh.
+
+The bridge uses `/kenny/map` when the aligned controller map is available. Otherwise
+it uses the raw SLAM map on `/map` in `slam_map`. Local SLAM poses are intentionally
+not placed at arbitrary coordinates on the uploaded `map` frame. A robot-relative
+scan remains available when global map projection is unavailable. The green arrow
+in that view points toward Kenny's actual front, accounting for the configured
+LiDAR mounting transform. Missing returns remain unknown, not plotted obstacles.
+
+For scanning while driving with the separate joystick, start the scan-only mapper:
+
+```bash
+systemctl --user start kenny-discovery-slam.service
+```
+
+It runs LiDAR/encoder SLAM without publishing any wheel command, and conflicts
+with the full autonomous navigation service to avoid duplicate SLAM instances.
+The live bridge never sends wheel commands; only explicit Apply pose requests
+initialize the map alignment. To access the map creator and joystick
+from Windows, keep this tunnel open:
+
+```powershell
+ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -L 8001:127.0.0.1:8001 -L 8002:127.0.0.1:8002 -L 8003:127.0.0.1:8003 kenny@kenny-desktop.local
+```
+
+Open `http://localhost:8001`. Choose **View live scan** if you returned to the
+editor; **Capture map for editing** copies a fresh measured raster into a project.
+Live telemetry is streamed at up to 5 Hz without resending an unchanged raster.
+Python bridge tests validate scan transforms, invalid returns, frame separation
+and stale-data handling. Browser verification checks actual SLAM-frame pose,
+projected hits, robot-relative scans and the scan-visibility toggle.

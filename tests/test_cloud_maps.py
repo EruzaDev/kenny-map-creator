@@ -9,7 +9,7 @@ from urllib.error import HTTPError
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT.parent / 'Kenny---Automotive-self-driving-trash-can'))
-from backend.cloud_maps import remote_map, upload, CloudMapError
+from backend.cloud_maps import remote_map, upload, CloudMapError, pending_calls
 
 
 class CloudMapTests(unittest.TestCase):
@@ -43,6 +43,16 @@ class CloudMapTests(unittest.TestCase):
             with self.assertRaisesRegex(CloudMapError, 'Finish pending calls') as raised:
                 remote_map()
             self.assertEqual(raised.exception.status, 409)
+
+    def test_queue_preflight_is_read_only_and_identifies_upload_blockers(self):
+        packet={'jobs':[{'id':'call-1','marker_id':5,'status':'queued','worker':None}]}
+        with patch.dict('os.environ',{'KENNY_API_URL':'https://test.example','KENNY_PI_TOKEN':'secret'}),patch('backend.cloud_maps.urlopen')as send:
+            send.return_value.__enter__.return_value=io.BytesIO(json.dumps(packet).encode())
+            self.assertEqual(pending_calls(),{'jobs':[{'id':'call-1','marker_id':5,'status':'queued'}]})
+            request=send.call_args.args[0]
+            self.assertEqual(request.full_url,'https://test.example/api/pi/queue')
+            self.assertIsNone(request.data)
+            self.assertEqual(request.get_header('Authorization'),'Bearer secret')
 
 
 if __name__ == '__main__':

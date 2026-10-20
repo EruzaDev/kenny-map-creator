@@ -18,6 +18,8 @@ class DispatchTests(unittest.TestCase):
         self.addCleanup(temp.cleanup)
         self.state = Path(temp.name) / 'receiver.json'
         self.patch('STATE', self.state)
+        self.deployment = Path(temp.name) / 'deployment.json'
+        self.patch('DEPLOYMENT', self.deployment)
         self.patch('models', return_value=[{'id': 'test/best.zip'}])
         self.environment = json.loads((ROOT / 'fixtures/marker-destination-room.json').read_text())
         marker = next(m for m in self.environment['markers'] if m['id'] == 12)
@@ -90,6 +92,17 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(dispatch.tick(self.payload)['status'], 'failed')
         self.assertIsNone(dispatch.tick(self.payload)['job'])
         self.assertEqual(simulate.call_count, 1)
+
+    def test_robot_mode_blocks_simulation_claims_and_pose_uploads(self):
+        self.deployment.write_text(json.dumps({'mode': 'robot'}))
+        post = self.patch('post')
+        simulate = self.patch('simulate')
+        with self.assertRaisesRegex(ValueError, 'Robot mode is active'):
+            dispatch.tick(self.payload)
+        with self.assertRaisesRegex(ValueError, 'Robot mode is active'):
+            dispatch.publish_simulation_pose({'pose': [1, 2, 0]})
+        post.assert_not_called()
+        simulate.assert_not_called()
 
 
 if __name__ == '__main__':

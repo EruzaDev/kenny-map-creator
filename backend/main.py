@@ -9,10 +9,29 @@ from .navigation import models, simulate, warm
 from .services import marker_image, png, marker_pdf, export_bundle, import_grid
 from .usb import usb_request
 from .dispatch import tick, DispatchUnavailable, publish_simulation_pose
-from .cloud_maps import remote_map, upload, CloudMapError
+from .cloud_maps import remote_map, upload, CloudMapError, pending_calls
 from .marker_optimization import optimize
+from .placement import apply_placement
 
 app=FastAPI(title='Kenny Environment Editor')
+
+
+@app.post('/api/live/pose')
+def operator_pose(payload:dict,request:Request):
+    if request.headers.get('origin')!=str(request.base_url).rstrip('/') or request.headers.get('X-Kenny-Placement')!='apply':
+        raise HTTPException(403,'Explicit same-origin placement request required')
+    try:return apply_placement(payload,getattr(app.state,'mapping_source',None))
+    except CloudMapError as error:raise HTTPException(error.status,str(error))
+    except (ValueError,OSError,TypeError,KeyError) as error:raise HTTPException(409,str(error))
+
+
+@app.post('/api/cloud/queue')
+def cloud_queue(request:Request):
+    origin=request.headers.get('origin')
+    if origin and origin!=str(request.base_url).rstrip('/'):
+        raise HTTPException(403,'Commands require this editor origin')
+    try:return pending_calls()
+    except CloudMapError as error:raise HTTPException(error.status,str(error))
 
 
 @app.post('/api/cloud/map/{action}')
@@ -106,14 +125,19 @@ async def live(ws:WebSocket):
         if source is None:
             await ws.send_json({'type':'status','connected':False,'message':'ROS bridge unavailable. Start backend through ros/bridge.py on Kenny.'})
             await ws.close(); return
-        revision=-1
+        revision=-1;map_revision=-1
         while True:
             packet=source.snapshot()
             if packet and packet['revision']!=revision:
-                revision=packet['revision']; await ws.send_json(packet)
+                revision=packet['revision']
+                if packet.get('map_revision')==map_revision:
+                    packet={k:v for k,v in packet.items()if k!='grid'}
+                    packet['type']='telemetry'
+                else:map_revision=packet.get('map_revision')
+                await ws.send_json(packet)
             elif packet is None:
                 await ws.send_json({'type':'status','connected':True,'message':'Waiting for /map and TF from Kenny'})
-            await asyncio.sleep(1)
+            await asyncio.sleep(.2)
     except (WebSocketDisconnect,RuntimeError): pass
 
 

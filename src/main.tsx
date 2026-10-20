@@ -14,6 +14,12 @@ import type { SensorFrame } from './sensor-geometry';
 import { UsbReplayControl } from './UsbReplayControl';
 import { CloudMapPreview } from './CloudMapPreview';
 import type { CloudMap } from './CloudMapPreview';
+import { finitePoints, liveAge, scanMatchesFrame } from './live-sensors';
+import type { LiveScan } from './live-sensors';
+import { alignmentFromPlacement, transformPoint, transformPose, suggestPlacement } from './live-alignment';
+import type { Pose2 } from './live-alignment';
+import {relativeMarkerEstimates} from './marker-distance';
+import type {MarkerDistances} from './marker-distance';
 type MarkerOptimization = {
   markers: Marker[];
   changes: { id: number; before: Marker; after: Marker; visible_samples_before: number; visible_samples_after: number }[];
@@ -23,10 +29,22 @@ type MarkerOptimization = {
   detail: string;
 };
 type Live = {
-  type: 'map';
+  type: 'map' | 'telemetry';
   revision: number;
-  grid: Grid;
-  pose?: number[];
+  grid: Grid | null;
+  frame?: string;
+  map_revision?: number;
+  session_id?: string;
+  applied_map_sha256?: string | null;
+  tracking_error?: string | null;
+  pose?: number[] | null;
+  pose_frame?: string | null;
+  pose_age_s?: number | null;
+  pose_source?: string;
+  pose_error?: string | null;
+  uncertainty_m?: number | null;
+  scan?: LiveScan | null;
+  marker_observations?: MarkerDistances | null;
   received_at: number;
   map_age_seconds?: number;
 };
@@ -104,6 +122,8 @@ function App() {
   const receiverLease = useRef(false);
   const [modelReady, setModelReady] = useState(false);
   const [cloudMap, setCloudMap] = useState<CloudMap | null>(null);
+  const [renderUploadStatus,setRenderUploadStatus]=useState('');
+  const [renderQueue,setRenderQueue]=useState<{id:string;marker_id:number;status:string}[]|null>(null);
   const [markerOptimization, setMarkerOptimization] = useState<{ source: Project; result: MarkerOptimization } | null>(null);
   const [maximumMarkerShift, setMaximumMarkerShift] = useState(1.5);
   const [markerSpacing, setMarkerSpacing] = useState(.6);
@@ -246,6 +266,12 @@ function App() {
     [viewLive, setViewLive] = useState(false),
     [now, setNow] = useState(Date.now());
   const [opacity, setOpacity] = useState(.45);
+  const [showLivePose,setShowLivePose]=useState(true),[showLiveScan,setShowLiveScan]=useState(true),[showLiveRays,setShowLiveRays]=useState(false);
+  const [showMarkerDistanceEstimates,setShowMarkerDistanceEstimates]=useState(true);
+  const [placingKenny,setPlacingKenny]=useState(false);
+  const [alignmentPreview,setAlignmentPreview]=useState<{transform:Pose2;frame:string;session?:string}|null>(null);
+  const [alignmentMessage,setAlignmentMessage]=useState('');
+  const placementDrag=useRef<{point:number[];pose:Pose2}|null>(null);
   posePoll.current = async () => {
     if (!receiverEnabled || !receiverLease.current || !replayFrame || !replay || usbDriving || poseBusy.current) return;
     poseBusy.current = true;
@@ -342,16 +368,33 @@ function App() {
     }
   }, [project]);
   useEffect(() => {
-    const timer = setInterval(() => setNow(Date.now()), 1000);
+    const timer = setInterval(() => setNow(Date.now()), 250);
     return () => {
       clearInterval(timer);
       socket.current?.close();
     };
   }, []);
-  const grid = viewLive && live ? live.grid : project.grid,
+  const grid = viewLive && live?.grid ? live.grid : project.grid,
     W = grid.width * grid.resolution,
     H = grid.height * grid.resolution;
-  const stale = live ? now - live.received_at + (live.map_age_seconds || 0) * 1000 > 5000 : true;
+  const stale = live?.grid ? now - live.received_at + (live.map_age_seconds || 0) * 1000 > 5000 : true;
+  const displayFrame=viewLive&&live?.grid?(live.frame||'map'):project.frame_id;
+  const previewValid=Boolean(!viewLive&&alignmentPreview&&live?.pose&&live.pose_frame===alignmentPreview.frame&&live.session_id===alignmentPreview.session);
+  const previewPose=previewValid&&live?.pose&&alignmentPreview?transformPose(live.pose,alignmentPreview.transform):null;
+  const renderedPose=previewPose||live?.pose;
+  const physicalOverlay=Boolean(live&&connection==='Connected'&&(!replay||viewLive)&&(previewValid||live.pose_frame===displayFrame));
+  const physicalPoseAge=live?liveAge(live.pose_age_s,live.received_at,now):Infinity;
+  const scanFrameMatches=Boolean(live&&scanMatchesFrame(live.scan,displayFrame,live.received_at,now));
+  const rawScanFresh=Boolean(live?.scan&&liveAge(live.scan.age_s,live.received_at,now)<=.5&&connection==='Connected');
+  const previewWorldScan=Boolean(previewValid&&live?.scan?.frame===alignmentPreview?.frame);
+  const previewBaseScan=Boolean(previewValid&&physicalPoseAge<=.5&&Math.abs((live?.pose_age_s||0)-(live?.scan?.age_s||0))<=.12);
+  const placementScanSynchronized=Boolean(rawScanFresh&&physicalPoseAge<=.5&&Math.abs((live?.pose_age_s||0)-(live?.scan?.age_s||0))<=.12);
+  const physicalScanFresh=Boolean(rawScanFresh&&(previewValid?(previewWorldScan||previewBaseScan):scanFrameMatches));
+  const renderedScanPoints=live?.scan&&previewValid&&alignmentPreview?
+    previewWorldScan?live.scan.points.map(point=>transformPoint(point,alignmentPreview.transform)):
+    previewPose?live.scan.base_points.map(point=>transformPoint(point,previewPose)):[]:live?.scan?.points||[];
+  const renderedScanOrigin=live?.scan?.origin&&previewWorldScan&&alignmentPreview?transformPoint(live.scan.origin,alignmentPreview.transform):
+    previewPose?previewPose.slice(0,2):live?.scan?.origin;
   const image = useMemo(() => {
     const c = document.createElement('canvas');
     c.width = grid.width;
@@ -368,6 +411,10 @@ function App() {
     return c.toDataURL();
   }, [grid]);
   const chosen = selected?.kind === 'marker' ? project.markers.find(m => m.uid === selected.uid) : selected?.kind === 'obstacle' ? project.obstacles.find(o => o.uid === selected.uid) : null;
+  const relativeEstimates = live?.marker_observations?.dictionary===project.dictionary && connection==='Connected' ?
+    relativeMarkerEstimates(project.markers, {...live.marker_observations,
+      age_s:liveAge(live.marker_observations.age_s,live.received_at,now)},
+      selected?.kind==='marker'?project.markers.find(m=>m.uid===selected.uid)?.id:undefined) : [];
   function commit(next: Project, before = project) {
     setHistory(h => [...h.slice(-29), before]);
     setFuture([]);
@@ -407,6 +454,56 @@ function App() {
   function visual(p: number[]) {
     const q = toLocal(p, grid);
     return [q[0], H - q[1]];
+  }
+  function placeKenny(pose:Pose2) {
+    if(!live?.pose||!live.pose_frame||physicalPoseAge>.5||connection!=='Connected'){
+      setAlignmentMessage('A fresh measured Kenny pose is required. Reconnect the bridge or wait for SLAM.');
+      return;
+    }
+    setAlignmentPreview({transform:alignmentFromPlacement(pose,live.pose),frame:live.pose_frame,session:live.session_id});
+  }
+  function beginKennyPlacement() {
+    setViewLive(false);setPlaying(false);setReplay(null);setReceiverEnabled(false);
+    setCalibrating(false);setSelected(null);setTool('select');
+    setShowLivePose(true);setShowLiveScan(true);setPlacingKenny(true);
+    setAlignmentMessage('Click Kenny’s approximate position on the editor map, then adjust its heading.');
+    setMessage('Kenny placement preview: click its approximate position, then drag or rotate it to align the live scan.');
+    requestAnimationFrame(()=>svg.current?.scrollIntoView({block:'center',behavior:'smooth'}));
+  }
+  function changeKennyPlacement(index:number,value:number) {
+    if(!previewPose)return;
+    const pose=[...previewPose] as Pose2;
+    pose[index]=value;
+    placeKenny(pose);
+    setAlignmentMessage('Visual alignment preview. Move/rotate Kenny until blue scan hits line up with mapped walls.');
+  }
+  function suggestKennyPlacement() {
+    if(!previewPose||!placementScanSynchronized||!live?.scan?.base_points.length)return;
+    try {
+      const suggestion=suggestPlacement(project,live.scan.base_points,previewPose);
+      if(suggestion.after.matched<.3){
+        setAlignmentMessage('Not enough wall agreement to suggest a reliable placement. Adjust the map or place Kenny closer to the expected pose.');
+        return;
+      }
+      placeKenny(suggestion.pose);
+      setAlignmentMessage(`Nearby suggestion: ${(suggestion.after.matched*100).toFixed(0)}% of ${suggestion.samples} sampled hits within 10 cm of mapped walls. Mean clipped mismatch ${suggestion.before.mean.toFixed(2)} → ${suggestion.after.mean.toFixed(2)} m. Review visually; this is not robot localization or a clearance guarantee.`);
+    } catch(error) {setAlignmentMessage(error instanceof Error?error.message:String(error));}
+  }
+  async function applyKennyPlacement(){
+    if(!previewPose||!live?.pose||physicalPoseAge>.5||!live.session_id)throw Error('Fresh placement and live bridge session required');
+    const pose=[...previewPose],sourcePose=[...live.pose],sourceFrame=live.pose_frame,session=live.session_id,map=project;
+    try{
+      setAlignmentMessage('Checking the uploaded map and stationary wheels before applying pose…');
+      const active:CloudMap=await(await requestFile('/api/cloud/map/fetch',{})).json();
+      setCloudMap(active);
+      const response=await fetch('/api/live/pose',{method:'POST',headers:{'Content-Type':'application/json','X-Kenny-Placement':'apply'},
+        body:JSON.stringify({pose,source_pose:sourcePose,source_frame:sourceFrame,session_id:session,map_sha256:active.sha256,environment:map})});
+      const result=await response.json();
+      if(!response.ok)throw Error(result.detail||'Pose application refused');
+      setAlignmentPreview(null);setPlacingKenny(false);
+      const status=`Applied map pose: x ${pose[0].toFixed(2)} m, y ${pose[1].toFixed(2)} m, heading ${(pose[2]*180/Math.PI).toFixed(1)}°. Live SLAM/encoder movement now uses this alignment. No motor command issued.`;
+      setAlignmentMessage(status);setMessage(status);
+    }catch(error){setAlignmentMessage(error instanceof Error?error.message:String(error));throw error;}
   }
   function chooseDestination(id: number) {
     const marker = project.markers.find(m => m.id === id);
@@ -490,6 +587,12 @@ function App() {
   function pointerDown(e: React.PointerEvent<SVGSVGElement>) {
     if (e.button !== 0 && e.button !== 1) return;
     const point = world(e);
+    if(placingKenny&&!viewLive&&e.button===0){
+      placeKenny([point[0],point[1],previewPose?.[2]??grid.origin[2]]);
+      setPlacingKenny(false);
+      setAlignmentMessage('Kenny placed for preview. Drag the green robot or edit X, Y and heading; blue dots are the real scan.');
+      return;
+    }
     if (calibrating) {
       setCalPoints(p => [...p, local(e)].slice(-2));
       return;
@@ -623,11 +726,33 @@ function App() {
   }
   async function uploadCloudMap() {
     const snapshot = project;
-    const result: CloudMap = await (await requestFile('/api/cloud/map/upload', {
-      environment: snapshot, ...(cloudMap ? { expected_sha256: cloudMap.sha256 } : {})
-    })).json();
-    setCloudMap(result);
-    setMessage(`Uploaded “${snapshot.name}” to Render · revision ${result.revision}. Scanner destinations now use this map.`);
+    try{
+      validateProject(snapshot);
+      setRenderUploadStatus('Checking pending Render calls…');
+      const queue=await checkRenderQueue();
+      if(queue.length)throw Error('Render map replacement blocked by '+queue.map(job=>`ArUco ${job.marker_id} (${job.status})`).join(', ')+'. Finish or cancel these requests first.');
+      setRenderUploadStatus(`Uploading editor map “${snapshot.name}”…`);
+      const result: CloudMap = await (await requestFile('/api/cloud/map/upload', {
+        environment: snapshot, ...(cloudMap ? { expected_sha256: cloudMap.sha256 } : {})
+      })).json();
+      setCloudMap(result);
+      const status=`Uploaded “${snapshot.name}” to Render · revision ${result.revision}. Scanner destinations now use this map.`;
+      setRenderUploadStatus(status);setMessage(status);
+    }catch(error){setRenderUploadStatus(error instanceof Error?error.message:'Map upload failed');throw error;}
+  }
+  async function checkRenderQueue(){
+    const result:{jobs:{id:string;marker_id:number;status:string}[]} = await (await requestFile('/api/cloud/queue',{})).json();
+    setRenderQueue(result.jobs);
+    return result.jobs;
+  }
+  function requestMapUpload(){
+    if(viewLive){
+      setViewLive(false);setPlaying(false);setPan([0,0]);setZoom(1);
+      const status=`Showing your editor map “${project.name}”. Review it, then click Upload map to Render. Live scan data is only uploaded after Capture map for editing.`;
+      setRenderUploadStatus(status);setMessage(status);
+      return;
+    }
+    void task(uploadCloudMap);
   }
   function openCloudMap() {
     if (!cloudMap) return;
@@ -768,16 +893,13 @@ function App() {
         if (socket.current !== ws) return;
         try {
           const packet = JSON.parse(e.data);
-          if (packet.type === 'map') {
-            const check = {
-              ...fresh(),
-              grid: packet.grid
-            };
-            validateProject(check);
-            setLive({
-              ...packet,
-              received_at: Date.now()
-            });
+          if (packet.type === 'map'||packet.type==='telemetry') {
+            if (packet.grid) validateProject({...fresh(),grid:packet.grid});
+            if (packet.pose!=null&&(!Array.isArray(packet.pose)||packet.pose.length!==3||!packet.pose.every((v:unknown)=>typeof v==='number'&&Number.isFinite(v)))) throw Error('Invalid physical pose');
+            if (packet.scan) packet.scan={...packet.scan,points:finitePoints(packet.scan.points),base_points:finitePoints(packet.scan.base_points)};
+            setLive(previous=>({ ...packet,
+              grid:packet.grid??(previous?.frame===packet.frame?previous?.grid:null)??null,
+              received_at:Date.now()}));
             setConnection('Connected');
           } else setConnection(packet.message || 'Unavailable');
         } catch {
@@ -797,7 +919,7 @@ function App() {
     }
   }
   function capture() {
-    if (!live || stale || connection !== 'Connected') {
+    if (!live?.grid || stale || connection !== 'Connected') {
       setMessage('A fresh live map is required.');
       return;
     }
@@ -817,6 +939,7 @@ function App() {
     setZoom(1);
     setMessage('Map captured. Place start and goal in known free space, then add markers and obstacles.');
   }
+  useEffect(()=>{if(location.port==='8001')connect();},[]);
   const tools = [['select', '↖', 'Select'], ['pan', '✥', 'Pan'], ['marker', '▦', 'ArUco marker'], ['wall', '━', 'Wall'], ['obstacle', '▧', 'Obstacle'], ['prohibited', '⊘', 'No-go area'], ['start', '◉', 'Robot start'], ['goal', '⚑', 'Choose destination']];
   const vW = (W + 1) / zoom,
     vH = (H + 1) / zoom;
@@ -879,7 +1002,15 @@ function App() {
  <p className="hint">{project.markers.length} markers placed. Configure the physical detector to use the same dictionary.</p>
  <div className="dimensions"><Field label="Marker ID" value={markerId} onChange={setMarkerId} min={0} max={project.dictionary === 'DICT_4X4_1000' ? 999 : 49} step={1} /><Field label="Side · m" value={markerSize} onChange={setMarkerSize} min={.01} max={1} /></div><div className="marker-preview"><img src={`/api/markers/${markerId}.png?dictionary=${project.dictionary}`} alt={`ArUco marker ${markerId}`} /><div><strong>{project.dictionary}</strong><small>ID {markerId} · {markerSize * 1000} mm</small><a href={`/api/markers/${markerId}.png?dictionary=${project.dictionary}`} download={`marker-${markerId}.png`}>Download PNG ↗</a></div></div><label className="field">Print layout<select aria-label="Markers per page" value={markersPerPage} onChange={e => setMarkersPerPage(Number(e.target.value) as 1 | 2 | 4)}><option value={1}>1 marker per page</option><option value={2}>2 markers per page</option><option value={4}>4 markers per page</option></select></label><p className="hint">Large markers are scaled to fit the chosen layout; the PDF labels the actual printed size.</p><button className="full" disabled={busy || !project.markers.length} onClick={() => void task(async () => download(await (await requestFile('/api/markers/pdf', {...project, markers_per_page: markersPerPage})).blob(), 'kenny-markers.pdf'))}>Print placed markers</button></div></aside>
  <main><div className="canvas-toolbar"><div><span className="status-dot" /> {viewLive ? 'LIVE ROOM SCAN' : 'MAP EDITOR'} <span className="muted">/ {project.name}</span></div><div><button disabled={!history.length || viewLive} onClick={undo} title="Undo">↶</button><button disabled={!future.length || viewLive} onClick={redo} title="Redo">↷</button><label><input type="checkbox" checked={snap} onChange={e => setSnap(e.target.checked)} /> Snap 10 cm</label></div></div>
- {message && <div role="status" className="notice">{message}<button onClick={() => setMessage('')}>×</button></div>}
+  {message && <div role="status" className="notice">{message}<button onClick={() => setMessage('')}>×</button></div>}
+  {!viewLive&&(placingKenny||previewPose)&&<div className="calibration" aria-label="Kenny scan alignment controls">
+    <strong>{placingKenny?'Click the map to place Kenny':'Kenny placement preview'}</strong>
+    {previewPose&&<><span className="hint">X {previewPose[0].toFixed(2)} · Y {previewPose[1].toFixed(2)} m · {(previewPose[2]*180/Math.PI).toFixed(1)}°</span>
+      <button onClick={()=>changeKennyPlacement(2,previewPose[2]-5*Math.PI/180)}>↺ −5°</button>
+      <button onClick={()=>changeKennyPlacement(2,previewPose[2]+5*Math.PI/180)}>↻ +5°</button>
+      <button disabled={!placementScanSynchronized} onClick={suggestKennyPlacement}>Suggest pose</button></>}
+    <button onClick={()=>{setPlacingKenny(false);setAlignmentPreview(null);setAlignmentMessage('Placement preview cleared.');}}>Close preview</button>
+  </div>}
  {calibrating && <div className="calibration"><strong>Calibrate floor plan · {calPoints.length}/2 points</strong><Field label="Actual distance · m" value={realDistance} onChange={setRealDistance} min={.01} /><button disabled={calPoints.length !== 2} onClick={calibrate}>Apply scale</button><button onClick={() => {
             setCalibrating(false);
             setCalPoints([]);
@@ -900,7 +1031,7 @@ function App() {
             e.preventDefault();
             add(e.dataTransfer.getData('text/kenny-tool'), world(e));
           }} style={{
-            cursor: calibrating ? 'crosshair' : tool === 'pan' ? 'grab' : tool === 'select' ? 'default' : 'crosshair'
+             cursor: calibrating||placingKenny ? 'crosshair' : tool === 'pan' ? 'grab' : tool === 'select' ? 'default' : 'crosshair'
           }}>
  <defs><pattern id="grid" width=".5" height=".5" patternUnits="userSpaceOnUse"><path d="M .5 0 H 0 V .5" fill="none" stroke="#afc6bd" strokeWidth=".009" /></pattern></defs><rect x={-.04} y={-.04} width={W + .08} height={H + .08} fill="#b4c9be" rx=".02" /><image href={image} width={W} height={H} style={{
               imageRendering: 'pixelated'
@@ -942,17 +1073,24 @@ function App() {
    const p=visual([m.x,m.y]);
    return <g key={m.uid}><circle cx={p[0]} cy={p[1]} r={Math.max(.3,m.size/2+.15)} fill="#4ade80" opacity=".3" /><circle cx={p[0]} cy={p[1]} r={Math.max(.3,m.size/2+.15)} fill="none" stroke="#16a34a" strokeWidth=".05" /></g>;
  })}</g>}
- {!viewLive && project.markers.map(m => {
+  {!viewLive && project.markers.map(m => {
               const p = visual([m.x, m.y]),
                 s = Math.max(.3, m.size);
               return <g key={m.uid} data-kind="marker" data-uid={m.uid} transform={`translate(${p[0]},${p[1]})`}><g transform={`rotate(${-(m.yaw - grid.origin[2]) * 180 / Math.PI})`}><rect x={-s / 2 - .04} y={-s / 2 - .04} width={s + .08} height={s + .08} rx=".025" fill={selected?.uid === m.uid ? '#0b8b69' : '#fff'} stroke="#0b8b69" strokeWidth=".015" /><image href={`/api/markers/${m.id}.png?dictionary=${project.dictionary}`} x={-s / 2} y={-s / 2} width={s} height={s} /><path d={`M 0 ${-s / 2 - .06} l -.04 .07 h .08 Z`} fill="#0b8b69" /></g><text y={s / 2 + .2} textAnchor="middle" fontSize=".15" fill="#11694f">ID {m.id} · {m.mount}</text></g>;
-            })}
+             })}
+  {!viewLive && showMarkerDistanceEstimates && relativeEstimates.length>0 && <g pointerEvents="none" aria-label="Provisional ArUco spacing estimates">{relativeEstimates.map(estimate=>{
+    const original=project.markers.find(m=>m.id===estimate.id)!;
+    const start=visual([original.x,original.y]),end=visual([estimate.x,estimate.y]);
+    return <g key={estimate.id}><line x1={start[0]} y1={start[1]} x2={end[0]} y2={end[1]} stroke="#b453cc" strokeWidth=".035" strokeDasharray=".09 .06" />
+      <circle cx={end[0]} cy={end[1]} r=".16" fill="none" stroke="#b453cc" strokeWidth=".04" strokeDasharray=".06 .04" />
+      <text x={end[0]+.2} y={end[1]-.12} fill="#793a91" fontSize=".15">ID {estimate.id} ≈ depth spacing</text></g>;
+  })}</g>}
   {!viewLive && markerOptimization?.source === project && <g pointerEvents="none" aria-label="Suggested ArUco positions">{markerOptimization.result.changes.map(change => {
     const before = visual([change.before.x, change.before.y]), after = visual([change.after.x, change.after.y]);
     const facing = visual([change.after.x + Math.cos(change.after.yaw) * .4, change.after.y + Math.sin(change.after.yaw) * .4]);
     return <g key={change.id} data-marker-optimization-id={change.id}><line x1={before[0]} y1={before[1]} x2={after[0]} y2={after[1]} stroke="#8956bd" strokeWidth=".04" strokeDasharray=".1 .06" /><circle cx={after[0]} cy={after[1]} r=".25" fill="#8956bd" fillOpacity=".15" stroke="#8956bd" strokeWidth=".035" /><line x1={after[0]} y1={after[1]} x2={facing[0]} y2={facing[1]} stroke="#8956bd" strokeWidth=".035" /><text x={after[0] + .3} y={after[1]} fill="#7543a9" fontSize=".17">ID {change.id} suggestion</text></g>;
   })}</g>}
-  {!viewLive && (['start', 'goal'] as const).filter(k => k === 'start' || project.destination_marker_id != null).map(k => {
+   {!viewLive && (['start', 'goal'] as const).filter(k => k === 'start' ? !(physicalOverlay&&showLivePose&&live?.pose) : project.destination_marker_id != null).map(k => {
               const p = visual(project[k]);
               return <g key={k} data-kind={k} data-uid={k} transform={`translate(${p[0]},${p[1]})`}><circle r={k === 'start' ? .19 : .25} fill={k === 'start' ? '#198e71' : 'none'} stroke={k === 'start' ? 'white' : '#eea247'} strokeWidth=".04" pointerEvents={k === 'goal' ? 'visibleStroke' : 'auto'} />{k === 'start' && <text y=".05" textAnchor="middle" fontSize=".15" fill="white">K</text>}<text y={k === 'start' ? .4 : .6} textAnchor="middle" fontSize=".15" fill="#47565e">{k === 'start' ? 'KENNY' : `DESTINATION · ID ${project.destination_marker_id}`}</text></g>;
             })}
@@ -961,16 +1099,30 @@ function App() {
                   estimated = visual(replayFrame.estimate);
                 return <><circle cx={estimated[0]} cy={estimated[1]} r={replay.robot_radius + .03} fill="none" stroke="#c266aa" strokeWidth=".02" strokeDasharray=".04 .03" /><g transform={`translate(${p[0]},${p[1]}) rotate(${-(replayFrame.pose[2] - grid.origin[2]) * 180 / Math.PI})`}><circle r={replay.robot_radius} fill={replayFrame.intervened ? '#e5982c' : '#0b996f'} stroke="white" strokeWidth=".025" /><path d={`M ${replay.robot_radius + .1} 0 l -.1 -.065 v .13 Z`} fill="#0b996f" /></g></>;
               })()}</g>}
- {viewLive && live?.pose && (() => {
-              const p = visual(live.pose);
-              return <g transform={`translate(${p[0]},${p[1]}) rotate(${-(live.pose[2] - grid.origin[2]) * 180 / Math.PI})`}><circle r=".2" fill="#119b78" /><path d="M .32 0 L .14 -.1 L .14 .1 Z" fill="#119b78" /></g>;
-            })()}
+  {showLiveScan&&physicalScanFresh&&live?.scan&&<g pointerEvents="none" aria-label="Live measured LiDAR scans">{renderedScanPoints.map((point,i)=>{
+    const p=visual(point),origin=renderedScanOrigin?visual(renderedScanOrigin):null;
+    return <g key={i}>{showLiveRays&&origin&&<line x1={origin[0]} y1={origin[1]} x2={p[0]} y2={p[1]} stroke="#278be1" strokeWidth=".008" opacity=".2"/>}<circle cx={p[0]} cy={p[1]} r=".025" fill="#278be1"/></g>;
+  })}</g>}
+  {physicalOverlay&&showLivePose&&live&&renderedPose&&(()=>{
+               const p = visual(renderedPose);
+               const fresh=physicalPoseAge<=.5,color=fresh?'#119b78':'#83918b';
+               return <g pointerEvents={previewValid?'all':'none'} aria-label={previewValid?'Kenny placement preview':fresh?'Live Kenny pose estimate':'Stale Kenny pose estimate'}
+                 style={{cursor:previewValid?'grab':undefined}}
+                 onPointerDown={e=>{if(!previewPose||physicalPoseAge>.5)return;e.stopPropagation();placementDrag.current={point:world(e),pose:previewPose};e.currentTarget.setPointerCapture(e.pointerId);}}
+                 onPointerMove={e=>{const drag=placementDrag.current;if(!drag)return;e.stopPropagation();const point=world(e);placeKenny([drag.pose[0]+point[0]-drag.point[0],drag.pose[1]+point[1]-drag.point[1],drag.pose[2]]);}}
+                 onPointerUp={e=>{e.stopPropagation();placementDrag.current=null;}}
+                 onPointerCancel={()=>{placementDrag.current=null;}}>
+                 {!previewValid&&live.uncertainty_m!=null&&Number.isFinite(live.uncertainty_m)&&live.uncertainty_m>0&&<circle cx={p[0]} cy={p[1]} r={live.uncertainty_m} fill={color} fillOpacity=".08" stroke={color} strokeWidth=".015" strokeDasharray=".06 .04"/>}
+                 <g transform={`translate(${p[0]},${p[1]}) rotate(${-(renderedPose[2]-grid.origin[2])*180/Math.PI})`}><circle r=".163" fill={color} stroke="white" strokeWidth=".02"/><path d="M .3 0 L .12 -.09 L .12 .09 Z" fill={color}/></g>
+                 <text x={p[0]+.25} y={p[1]-.2} fill={color} fontSize=".16">Kenny{previewValid?' · placement preview':fresh?'':' · stale'}</text>
+               </g>;
+             })()}
  {calPoints.map((p, i) => <circle key={i} cx={p[0]} cy={H - p[1]} r=".08" fill="#e79937" />)}
  </svg><div className="zoom-controls"><button onClick={() => setZoom(z => Math.max(.25, z / 1.2))}>−</button><span>{Math.round(zoom * 100)}%</span><button onClick={() => setZoom(z => Math.min(8, z * 1.2))}>＋</button><button onClick={() => {
               setZoom(1);
               setPan([0, 0]);
             }}>Fit</button></div><div className="map-legend"><span><i className="free" />Free</span><span><i className="occupied" />Occupied</span><span><i className="unknown" />Unknown</span><span><i className="no-go" />No-go</span></div></div>
- <footer><span>{W.toFixed(2)} × {H.toFixed(2)} m <b>·</b> {grid.resolution * 100} cm / cell</span><span>{project.markers.length} markers <b>·</b> {project.obstacles.length} obstacles <b>·</b> Frame: map</span></footer></main>
+  <footer><span>{W.toFixed(2)} × {H.toFixed(2)} m <b>·</b> {grid.resolution * 100} cm / cell</span><span>{project.markers.length} markers <b>·</b> {project.obstacles.length} obstacles <b>·</b> Frame: {displayFrame}</span></footer></main>
  <aside className="right"><div className="section-heading">OBJECT PROPERTIES</div>{chosen ? <><h2>{selected?.kind === 'marker' ? `ArUco marker ${(chosen as Marker).id}` : `${(chosen as Obstacle).kind}`}</h2><p className="hint">Position in meters in the map frame.</p><div className="dimensions"><Field label="X · m" value={chosen.x} onChange={v => change('x', v)} /><Field label="Y · m" value={chosen.y} onChange={v => change('y', v)} /></div>{selected?.kind === 'marker' ? <><Field label="Marker ID" value={(chosen as Marker).id} onChange={v => change('id', v)} min={0} max={project.dictionary === 'DICT_4X4_1000' ? 999 : 49} step={1} /><Field label="Printed side · m" value={(chosen as Marker).size} onChange={v => change('size', v)} min={.01} max={1} /><label className="field">Mounting<select value={(chosen as Marker).mount} onChange={e => {
                 const mount = e.target.value;
                 commit({
@@ -1016,7 +1168,11 @@ function App() {
   <div className="navigation-panel"><div className="section-heading">RENDER MAP</div>
   <h2>Upload and inspect your map</h2>
   <p className="hint">https://kenny-api.onrender.com · The active map is stored with the server queue and survives restarts.</p>
-  <button className="full primary" disabled={busy || testing || usbDriving || viewLive || !project.markers.length} onClick={() => void task(uploadCloudMap)}>Upload map to Render</button>
+   <button id="uploadRenderMap" className="full primary" disabled={busy || testing || usbDriving} onClick={requestMapUpload}>{viewLive?'Return to editor to upload your map':'Upload map to Render'}</button>
+   {renderUploadStatus&&<p id="renderUploadStatus" role="status" className="hint">{renderUploadStatus}</p>}
+   {!project.markers.length&&<p className="hint">Geometry can be uploaded without markers. Add registered ArUco destinations before requesting navigation.</p>}
+   <button className="full" disabled={busy || testing || usbDriving} onClick={()=>void task(async()=>{const queue=await checkRenderQueue();setRenderUploadStatus(queue.length?'Pending calls block map replacement.':'No pending calls; the map queue is clear.');})}>Check pending Render calls</button>
+   {renderQueue?.length? <p className="hint">Blocking requests: {renderQueue.map(job=>`ID ${job.marker_id} · ${job.status} · ${job.id.slice(0,8)}`).join(' | ')}</p>:renderQueue&&<p className="hint">No pending/running Render calls.</p>}
   <button className="full" disabled={busy || testing || usbDriving} onClick={() => void task(fetchCloudMap)}>Fetch map from Render</button>
   {cloudMap && <><CloudMapPreview map={cloudMap} /><button className="full" disabled={busy || testing || usbDriving} onClick={openCloudMap}>Open fetched map in editor</button><button className="full" onClick={() => download(new Blob([JSON.stringify(cloudMap.environment, null, 2)], { type: 'application/json' }), 'render-environment.json')}>Download fetched environment.json</button></>}
   <p className="hint">Upload uses the current editor geometry and markers. Finish pending/running calls before replacing the server map. Fetch shows a read-only preview; Open is undoable.</p>
@@ -1095,7 +1251,45 @@ function App() {
  {modelError && <p className="hint">{modelError}</p>}<div className="dimensions"><Field label="Max steps" value={testSteps} onChange={setTestSteps} min={1} max={3000} step={100} /><Field label="Random seed" value={testSeed} onChange={setTestSeed} min={0} max={4294967295} step={1} /></div><button className="full primary" disabled={testing || !selectedModel || viewLive || calibrating || project.destination_marker_id == null} onClick={() => void runNavigation()}>{testing ? 'Running model…' : '▶ Run navigation test'}</button>{replay && <div className="test-result"><strong className={`outcome ${replay.info.event}`}>{replay.info.event === 'success' ? 'Destination reached' : replay.info.event === 'timeout' ? 'Time limit reached' : replay.info.event}</strong><div>Distance: {replay.info.path_length.toFixed(2)} m</div><div>Safety interventions: {replay.info.interventions}</div><div>Steps without a route: {replay.info.no_route_steps}</div><div>Localization error: {replay.info.localization_error.toFixed(3)} m</div><p className="hint">Green: traveled path · dashed blue: current planned route · purple: estimated pose · orange robot: safety guard intervention.</p>{replayFrame && <div className={`proximity ${replayFrame.near_goal ? 'near' : ''}`}>{replayFrame.near_goal ? 'I’m near · ' : ''}{replayFrame.distance_to_destination_m.toFixed(2)} m to destination{replay.destination_marker_id != null ? ` · ID ${replay.destination_marker_id}` : ''}</div>}{replayFrame && <div className="hint">Step {replayFrame.step} · {replayFrame.intervened ? 'Safety guard active' : replayFrame.event}</div>}<button className="full" onClick={() => download(new Blob([JSON.stringify(replay, null, 2)], {
               type: 'application/json'
             }), 'kenny-navigation-replay.json')}>Download test result</button></div>}</div>
- <div className="mapping-panel"><div className="section-heading">KENNY LIVE MAPPING</div><h2>Scan your environment</h2><p className="hint">Move Kenny with its manual controls. Capture the scanned map when you’re ready to edit.</p><label className="field">Mapping bridge URL<input value={bridge} onChange={e => setBridge(e.target.value)} placeholder="Same server, or ws://kenny:8000/api/live" /></label><div className="connection"><span className={`status-dot ${connection === 'Connected' && !stale ? '' : 'offline'}`} />{connection === 'Connected' && stale ? 'Connected · map stale' : connection}</div><div className="dimensions"><button onClick={connect}>Connect</button><button onClick={() => {
+  <div className="mapping-panel"><div className="section-heading">PLACE KENNY + ALIGN REAL SCANS</div>
+    <button id="placeLiveKenny" className="full primary" disabled={!live?.pose||physicalPoseAge>.5||connection!=='Connected'} onClick={beginKennyPlacement}>{placingKenny?'Click Kenny’s approximate position…':'Place Kenny on editor map'}</button>
+    {previewPose&&<>
+      <div className="dimensions"><Field label="Kenny X · m" value={previewPose[0]} onChange={v=>changeKennyPlacement(0,v)} step={.05}/><Field label="Kenny Y · m" value={previewPose[1]} onChange={v=>changeKennyPlacement(1,v)} step={.05}/></div>
+      <Field label="Kenny heading · degrees" value={previewPose[2]*180/Math.PI} onChange={v=>changeKennyPlacement(2,v*Math.PI/180)} step={5}/>
+      <div className="dimensions"><button onClick={()=>changeKennyPlacement(2,previewPose[2]-5*Math.PI/180)}>Rotate −5°</button><button onClick={()=>changeKennyPlacement(2,previewPose[2]+5*Math.PI/180)}>Rotate +5°</button></div>
+      <button id="suggestKennyAlignment" className="full secondary" disabled={!placementScanSynchronized} onClick={suggestKennyPlacement}>Suggest nearby scan alignment</button>
+      <button id="applyKennyPose" className="full primary" disabled={busy||physicalPoseAge>.5||!live?.session_id} onClick={()=>void task(applyKennyPlacement)}>Apply pose to robot/map</button>
+    </>}
+    {alignmentPreview&&<button className="full secondary" onClick={()=>{setAlignmentPreview(null);setPlacingKenny(false);setAlignmentMessage('Placement preview cleared.');}}>Clear placement preview</button>}
+    <p id="kennyAlignmentStatus" className="hint">{alignmentMessage||'Place Kenny roughly, rotate its heading, and compare the live blue scan dots with the walls. For the best comparison, keep the robot stationary while adjusting.'}</p>
+    {alignmentPreview&&!previewValid&&<p className="hint">The live frame/session changed or you are viewing live SLAM. Re-place Kenny on the editor map to establish a new preview.</p>}
+    <p className="hint">Placement is initially a visual overlay. Apply pose explicitly aligns live SLAM with the uploaded map while STOP is latched and wheels are stationary; it never moves the robot or changes the saved start. The editor geometry must match Render. Suggestions search within ±0.5 m and ±20°.</p>
+  </div>
+  <div className="mapping-panel"><div className="section-heading">PROVISIONAL ARUCO SPACING</div>
+    <label className="sound-toggle"><input type="checkbox" checked={showMarkerDistanceEstimates} onChange={e=>setShowMarkerDistanceEstimates(e.target.checked)}/> Show measured marker-distance estimates on the editor map</label>
+    <p className="hint">Point the RGB-D camera at two placed markers at once. Select a visible marker to anchor the estimates; otherwise the lowest visible ID is the anchor. Purple dashed marks show estimated positions along the map's existing bearing using measured spacing. These are provisional overlays only: saved marker positions, navigation goals and exports do not change.</p>
+    {relativeEstimates.length>0?<p className="hint">{relativeEstimates.slice(0,6).map(v=>`ID ${v.anchor_id}→${v.id}: depth ${v.measured_distance_m.toFixed(2)} m · map ${v.mapped_distance_m.toFixed(2)} m`).join(' | ')}</p>:<p className="hint">Waiting for two fresh, depth-supported ArUco sightings in one camera frame.</p>}
+  </div>
+  <div className="mapping-panel"><div className="section-heading">LIVE KENNY POSITION + LIDAR</div>
+    <p id="livePoseStatus" className="hint">{connection!=='Connected'?'Connect the mapping bridge to receive physical measurements':live?.pose?`${live.pose_source||'Measured pose'} · ${physicalPoseAge<=.5?'live':'stale'} · frame ${live.pose_frame||'map'} · age ${Number.isFinite(physicalPoseAge)?physicalPoseAge.toFixed(2):'—'} s`:'Robot pose unavailable; waiting for SLAM/TF'}</p>
+    {live?.pose&&<p className="hint">Source-frame x {live.pose[0].toFixed(2)} m · y {live.pose[1].toFixed(2)} m · heading {(live.pose[2]*180/Math.PI).toFixed(1)}°{live.uncertainty_m!=null?` · uncertainty ${live.uncertainty_m.toFixed(2)} m`:''}</p>}
+    {live?.pose&&live.pose_frame!==displayFrame&&!previewValid&&<p className="hint">Pose frame differs from this map. Place Kenny for an editor alignment preview, or view the live SLAM map.</p>}
+    {live?.pose_error&&<p className="hint">{live.pose_error}</p>}
+    {live?.applied_map_sha256&&<p className="hint">Operator placement applied to uploaded map {live.applied_map_sha256.slice(0,12)}… · absolute accuracy unverified</p>}
+    {live?.tracking_error&&<p className="hint">{live.tracking_error}</p>}
+    <label className="sound-toggle"><input type="checkbox" checked={showLivePose} onChange={e=>setShowLivePose(e.target.checked)}/> Show live Kenny pose + heading</label>
+    <label className="sound-toggle"><input type="checkbox" checked={showLiveScan} onChange={e=>setShowLiveScan(e.target.checked)}/> Show measured LiDAR hit points</label>
+    <label className="sound-toggle"><input type="checkbox" checked={showLiveRays} onChange={e=>setShowLiveRays(e.target.checked)}/> Show LiDAR rays</label>
+    <p id="liveScanStatus" className="hint">{live?.scan?`${rawScanFresh?'Live':'Stale'} scan · ${live.scan.valid}/${live.scan.samples} valid returns · ${physicalScanFresh?previewValid?'operator placement preview':`projected into ${displayFrame}`:'robot-relative view only'}`:'Waiting for LiDAR scans'}</p>
+    {rawScanFresh&&live?.scan&&<svg role="img" aria-label="Robot-relative live LiDAR scan" viewBox="-8 -8 16 16" style={{width:'100%',background:'#e8f1ed',borderRadius:8}}>
+      {[2,4,6].map(r=><circle key={r} cx="0" cy="0" r={r} fill="none" stroke="#b4c9be" strokeWidth=".03"/>)}
+      {live.scan.base_points.map((point,i)=><circle key={i} cx={point[0]} cy={-point[1]} r=".055" fill="#278be1"/>)}
+      <circle cx="0" cy="0" r=".18" fill="#119b78"/><path d="M .8 0 L .25 -.2 L .25 .2 Z" fill="#119b78"/>
+      <text x=".9" y="-.25" fontSize=".45" fill="#11694f">Kenny front →</text>
+    </svg>}
+    <p className="hint">Blue points are measured surfaces; missing returns stay unknown. Kenny position uses LiDAR SLAM and wheel odometry, not the saved start or simulation pose. This display issues no motor commands.</p>
+  </div>
+  <div className="mapping-panel"><div className="section-heading">KENNY LIVE MAPPING</div><h2>Scan your environment</h2><p className="hint">Move Kenny with its manual controls. Capture the scanned map when you’re ready to edit. The raw SLAM map is shown in its own frame until aligned with the uploaded map.</p><label className="field">Mapping bridge URL<input value={bridge} onChange={e => setBridge(e.target.value)} placeholder="Same server, or ws://kenny:8000/api/live" /></label><div className="connection"><span className={`status-dot ${connection === 'Connected' && !stale ? '' : 'offline'}`} />{connection === 'Connected' && stale ? 'Connected · map stale' : connection}</div><div className="dimensions"><button onClick={connect}>Connect</button><button onClick={() => {
               socket.current?.close();
               setConnection('Disconnected');
               setViewLive(false);

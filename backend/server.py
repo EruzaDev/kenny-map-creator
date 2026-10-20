@@ -22,7 +22,8 @@ from kenny_rl.environment import validate_environment
 from backend.navigation import models, simulate, warm
 from backend.usb import usb_request
 from backend.dispatch import tick, DispatchUnavailable, publish_simulation_pose
-from backend.cloud_maps import remote_map, upload, CloudMapError
+from backend.cloud_maps import remote_map, upload, CloudMapError, pending_calls
+from backend.placement import apply_placement
 from backend.marker_optimization import optimize
 
 
@@ -51,10 +52,12 @@ class Handler(BaseHTTPRequestHandler):
         self.respond(target.read_bytes(),content_type=mimetypes.guess_type(target)[0] or 'application/octet-stream')
     def do_POST(self):
         try:
-            if self.path.startswith(('/api/usb/', '/api/dispatch/', '/api/cloud/')):
+            if self.path.startswith(('/api/usb/', '/api/dispatch/', '/api/cloud/', '/api/live/')):
                 origin=self.headers.get('Origin')
                 if origin and origin!='http://'+self.headers.get('Host',''):
                     return self.respond({'detail':'Commands require this editor origin'},403)
+                if self.path=='/api/live/pose' and (origin!='http://'+self.headers.get('Host','') or self.headers.get('X-Kenny-Placement')!='apply'):
+                    return self.respond({'detail':'Explicit same-origin placement request required'},403)
             length=int(self.headers.get('Content-Length',0))
             if not 0<length<=60_000_000:raise ValueError('Request size must be 1–60 MB')
             payload=json.loads(self.rfile.read(length))
@@ -66,6 +69,8 @@ class Handler(BaseHTTPRequestHandler):
             if self.path=='/api/dispatch/pose':return self.respond(publish_simulation_pose(payload))
             if self.path=='/api/cloud/map/fetch':return self.respond(remote_map())
             if self.path=='/api/cloud/map/upload':return self.respond(upload(payload))
+            if self.path=='/api/cloud/queue':return self.respond(pending_calls())
+            if self.path=='/api/live/pose':return self.respond(apply_placement(payload,getattr(self.server,'mapping_source',None)))
             if self.path=='/api/markers/optimize':return self.respond(optimize(payload))
             if self.path=='/api/export':return self.respond(export_bundle(payload),content_type='application/zip',filename='kenny-environment.zip')
             if self.path=='/api/import-map':return self.respond(import_grid(payload))
@@ -93,14 +98,19 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if source is None:
                 frame(json.dumps({'type':'status','connected':False,'message':'ROS bridge unavailable. Start ros/bridge.py on Kenny.'}).encode());frame(b'',8);return
-            revision=-1
+            revision=-1;map_revision=-1
             while True:
                 packet=source.snapshot()
                 if packet and packet['revision']!=revision:
-                    revision=packet['revision'];frame(json.dumps(packet,allow_nan=False).encode())
+                    revision=packet['revision']
+                    if packet.get('map_revision')==map_revision:
+                        packet={k:v for k,v in packet.items()if k!='grid'}
+                        packet['type']='telemetry'
+                    else:map_revision=packet.get('map_revision')
+                    frame(json.dumps(packet,allow_nan=False).encode())
                 elif not packet:
                     frame(json.dumps({'type':'status','connected':True,'message':'Waiting for /map and TF from Kenny'}).encode())
-                time.sleep(1)
+                time.sleep(.2)
         except (BrokenPipeError,ConnectionResetError,OSError):return
 
 

@@ -1,6 +1,7 @@
 """Same-origin editor adapter to the deployed API's persistent active map."""
 import json
 import os
+import time
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -61,3 +62,43 @@ def upload(payload):
     if expected is None:
         expected = remote_map()['sha256']
     return remote_map({'environment': environment, 'expected_sha256': expected})
+
+
+def pending_calls():
+    base=os.environ.get('KENNY_API_URL','https://kenny-api.onrender.com').rstrip('/')
+    token=os.environ.get('KENNY_PI_TOKEN') or os.environ.get('KENNY_DISPATCH_TOKEN','')
+    headers={'Accept':'application/json'}
+    if token:headers['Authorization']=f'Bearer {token}'
+    try:
+        with urlopen(Request(base+'/api/pi/queue',headers=headers),timeout=15) as response:
+            packet=json.load(response)
+        if not isinstance(packet,dict) or not isinstance(packet.get('jobs'),list):raise ValueError('Invalid queue response')
+        return {'jobs':[{'id':job['id'],'marker_id':job['marker_id'],'status':job['status']}for job in packet['jobs']]}
+    except HTTPError as error:
+        raise CloudMapError(f'Render queue check failed: HTTP {error.code}',error.code) from error
+    except (URLError,TimeoutError,ConnectionError,ValueError,KeyError,TypeError) as error:
+        raise CloudMapError(f'Cannot check pending Render calls: {error}') from error
+
+
+def publish_placed_pose(snapshot):
+    base=os.environ.get('KENNY_API_URL','https://kenny-api.onrender.com').rstrip('/')
+    token=os.environ.get('KENNY_PI_TOKEN') or os.environ.get('KENNY_DISPATCH_TOKEN','')
+    headers={'Content-Type':'application/json'}
+    if token:headers['Authorization']=f'Bearer {token}'
+    pose=snapshot['pose']
+    payload={'worker':'kenny-editor-placement','source':'physical',
+        'pose':{'frame_id':'map','x':pose[0],'y':pose[1],'yaw':pose[2]},
+        'map_sha256':snapshot['applied_map_sha256'],
+        'observed_at':time.time()-snapshot.get('pose_age_s',0),
+        'uncertainty_m':None,'status':'idle',
+        'detail':'Operator-initialized approximate pose tracked with LiDAR SLAM and encoders; not verified navigation arrival',
+        'route':[],'goal':None}
+    try:
+        with urlopen(Request(base+'/api/pi/pose',data=json.dumps(payload,allow_nan=False).encode(),headers=headers),timeout=15)as response:
+            return json.load(response)
+    except HTTPError as error:
+        try:detail=json.loads(error.read(16384)).get('detail',str(error))
+        except (ValueError,AttributeError):detail=str(error)
+        raise CloudMapError(f'Placed pose tracking unavailable: {detail}',error.code)from error
+    except (URLError,TimeoutError,ValueError)as error:
+        raise CloudMapError(f'Placed pose tracking unavailable: {error}')from error
